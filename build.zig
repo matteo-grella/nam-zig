@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("fucina", fucina);
-    configureAudio(exe);
+    configureNative(exe);
     b.installArtifact(exe);
 
     const run = b.addRunArtifact(exe);
@@ -43,17 +43,34 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addImport("fucina", fucina);
-    configureAudio(tests);
+    configureNative(tests);
     b.step("test", "Run the unit tests").dependOn(&b.addRunArtifact(tests).step);
+
+    // `zig build app`: the macOS application bundle (zig-out/nam-zig.app),
+    // which is what gives the microphone permission prompt the app's own
+    // name. Ad-hoc signed when codesign is available.
+    const app_step = b.step("app", "Assemble the macOS application bundle (zig-out/nam-zig.app)");
+    const app_bin = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "nam-zig.app/Contents/MacOS" } } });
+    const app_plist = b.addInstallFile(b.path("packaging/Info.plist"), "nam-zig.app/Contents/Info.plist");
+    const app_pkginfo = b.addInstallFile(b.path("packaging/PkgInfo"), "nam-zig.app/Contents/PkgInfo");
+    const app_icon = b.addInstallFile(b.path("packaging/nam-zig.icns"), "nam-zig.app/Contents/Resources/nam-zig.icns");
+    const sign = b.addSystemCommand(&.{ "codesign", "--force", "--deep", "--sign", "-", b.getInstallPath(.prefix, "nam-zig.app") });
+    sign.step.dependOn(&app_bin.step);
+    sign.step.dependOn(&app_plist.step);
+    sign.step.dependOn(&app_pkginfo.step);
+    sign.step.dependOn(&app_icon.step);
+    app_step.dependOn(&sign.step);
 }
 
-/// The audio and MIDI device layer: the vendored miniaudio build (one
-/// MINIAUDIO_IMPLEMENTATION translation unit, `src/audio_shim.c`) plus the
-/// CoreMIDI shim (`src/midi_shim.c`, stubs off macOS), libc, and the
-/// CoreAudio/CoreMIDI frameworks on macOS (MA_NO_RUNTIME_LINKING in
+/// The device layers: the vendored miniaudio build (one
+/// MINIAUDIO_IMPLEMENTATION translation unit, `src/audio_shim.c`), the
+/// CoreMIDI shim (`src/midi_shim.c`, stubs off macOS), the window shim
+/// (`src/window_shim.m`: AppKit + WebKit + the microphone-permission query;
+/// `src/window_shim.c` elsewhere: GTK/WebKitGTK loaded at runtime when
+/// present), libc, and the frameworks on macOS (MA_NO_RUNTIME_LINKING in
 /// `miniaudio_config.h`); elsewhere miniaudio dlopens its backend at
 /// runtime through libc.
-fn configureAudio(step: *std.Build.Step.Compile) void {
+fn configureNative(step: *std.Build.Step.Compile) void {
     const module = step.root_module;
     module.link_libc = true;
     for ([_][]const u8{ "src/audio_shim.c", "src/midi_shim.c" }) |source| {
@@ -64,8 +81,18 @@ fn configureAudio(step: *std.Build.Step.Compile) void {
     }
     const target = module.resolved_target.?.result;
     if (target.os.tag == .macos) {
-        for ([_][]const u8{ "CoreFoundation", "CoreAudio", "AudioToolbox", "CoreMIDI" }) |framework| {
+        module.addCSourceFile(.{
+            .file = step.step.owner.path("src/window_shim.m"),
+            .flags = &.{ "-fno-sanitize=undefined", "-fobjc-arc", "-O2" },
+        });
+        for ([_][]const u8{ "CoreFoundation", "CoreAudio", "AudioToolbox", "CoreMIDI", "Cocoa", "WebKit", "AVFoundation" }) |framework| {
             module.linkFramework(framework, .{});
         }
+    } else {
+        module.addCSourceFile(.{
+            .file = step.step.owner.path("src/window_shim.c"),
+            .flags = &.{ "-fno-sanitize=undefined", "-O2" },
+        });
+        if (target.os.tag == .linux) module.linkSystemLibrary("dl", .{});
     }
 }

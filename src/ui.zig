@@ -11,6 +11,7 @@
 //!     stdout is not a tty (pipes / CI).
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 // ---------------------------------------------------------------------------
 // ANSI / DEC escapes
@@ -47,67 +48,65 @@ const key_hints = [_][]const u8{
 // Raw terminal + signal-safe restore
 // ---------------------------------------------------------------------------
 
-extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+const is_posix = builtin.os.tag != .windows;
 
-/// Current terminal size in character cells, or null when stdout is not a tty.
-fn termSize() ?struct { rows: usize, cols: usize } {
-    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    if (ioctl(1, @intCast(std.posix.T.IOCGWINSZ), &ws) != 0) return null;
-    if (ws.row == 0 or ws.col == 0) return null;
-    return .{ .rows = ws.row, .cols = ws.col };
-}
+/// The POSIX terminal layer (termios raw mode, window size, signal-safe
+/// restore); Windows gets inert stubs and the terminal player degrades to a
+/// non-interactive stream there (the window is the interactive path).
+const term = if (is_posix) struct {
+    extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
 
-const SavedTerminal = struct { fd: std.posix.fd_t, termios: std.posix.termios };
-/// Set while raw mode is active; read by the signal handler (async context),
-/// so it stays a plain optional that is written once on enable and cleared on
-/// restore.
-var g_saved: ?SavedTerminal = null;
+    /// Current terminal size in character cells, or null when stdout is not a tty.
+    fn termSize() ?struct { rows: usize, cols: usize } {
+        var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+        if (ioctl(1, @intCast(std.posix.T.IOCGWINSZ), &ws) != 0) return null;
+        if (ws.row == 0 or ws.col == 0) return null;
+        return .{ .rows = ws.row, .cols = ws.col };
+    }
 
-fn signalRestore(sig: std.posix.SIG) callconv(.c) void {
-    if (g_saved) |s| std.posix.tcsetattr(s.fd, .NOW, s.termios) catch {};
-    // Raw libc write() is async-signal-safe; the buffered writer is not. The
-    // leading SGR reset clears any color/background left mid-frame.
-    const msg = reset ++ reset_region ++ show_cursor ++ "\r\n";
-    _ = std.c.write(1, msg, msg.len);
-    // Restore the default disposition and re-raise so the exit status reflects
-    // the signal instead of swallowing it.
-    var dfl = std.posix.Sigaction{
-        .handler = .{ .handler = std.posix.SIG.DFL },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(sig, &dfl, null);
-    std.posix.raise(sig) catch {};
-}
+    const SavedTerminal = struct { fd: std.posix.fd_t, termios: std.posix.termios };
+    /// Set while raw mode is active; read by the signal handler (async context),
+    /// so it stays a plain optional that is written once on enable and cleared on
+    /// restore.
+    var g_saved: ?SavedTerminal = null;
 
-fn setSignals(handler: ?std.posix.Sigaction.handler_fn) void {
-    var act = std.posix.Sigaction{
-        .handler = .{ .handler = handler },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(.INT, &act, null);
-    std.posix.sigaction(.TERM, &act, null);
-    std.posix.sigaction(.HUP, &act, null);
-    // Crash paths too (Zig panic -> abort() -> ABRT; memory/illegal faults), so
-    // a crash also leaves the terminal sane. signalRestore re-raises to DFL,
-    // preserving the core dump / panic trace.
-    std.posix.sigaction(.ABRT, &act, null);
-    std.posix.sigaction(.SEGV, &act, null);
-    std.posix.sigaction(.BUS, &act, null);
-    std.posix.sigaction(.ILL, &act, null);
-    std.posix.sigaction(.FPE, &act, null);
-}
+    fn signalRestore(sig: std.posix.SIG) callconv(.c) void {
+        if (g_saved) |s| std.posix.tcsetattr(s.fd, .NOW, s.termios) catch {};
+        // Raw libc write() is async-signal-safe; the buffered writer is not. The
+        // leading SGR reset clears any color/background left mid-frame.
+        const msg = reset ++ reset_region ++ show_cursor ++ "\r\n";
+        _ = std.c.write(1, msg, msg.len);
+        // Restore the default disposition and re-raise so the exit status reflects
+        // the signal instead of swallowing it.
+        var dfl = std.posix.Sigaction{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(sig, &dfl, null);
+        std.posix.raise(sig) catch {};
+    }
 
-pub const RawTerminal = struct {
-    fd: std.posix.fd_t,
-    saved: std.posix.termios,
-    active: bool,
-    /// Set when a non-raw (non-tty) stdin reaches EOF — the caller should quit
-    /// rather than spin (a closed stdin can never deliver a quit key).
-    eof: bool = false,
+    fn setSignals(handler: ?std.posix.Sigaction.handler_fn) void {
+        var act = std.posix.Sigaction{
+            .handler = .{ .handler = handler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.INT, &act, null);
+        std.posix.sigaction(.TERM, &act, null);
+        std.posix.sigaction(.HUP, &act, null);
+        // Crash paths too (Zig panic -> abort() -> ABRT; memory/illegal faults), so
+        // a crash also leaves the terminal sane. signalRestore re-raises to DFL,
+        // preserving the core dump / panic trace.
+        std.posix.sigaction(.ABRT, &act, null);
+        std.posix.sigaction(.SEGV, &act, null);
+        std.posix.sigaction(.BUS, &act, null);
+        std.posix.sigaction(.ILL, &act, null);
+        std.posix.sigaction(.FPE, &act, null);
+    }
 
-    pub fn enable() !RawTerminal {
+    pub fn enableRaw() !RawTerminal {
         const fd: std.posix.fd_t = 0; // stdin
         // Non-tty stdin (piped input, CI, redirected): skip raw mode, still poll
         // reads (an EOF there signals quit via poll()). Check isatty first so a
@@ -133,19 +132,16 @@ pub const RawTerminal = struct {
         return .{ .fd = fd, .saved = saved, .active = true };
     }
 
-    pub fn restore(self: *RawTerminal) void {
-        if (!self.active) return;
+    pub fn restoreRaw(self: *RawTerminal) void {
         // Restore the device FIRST, then drop the handlers: at every instant
         // either a handler is still installed (it will restore + re-raise) or
         // the terminal is already cooked — no window where a signal kills us raw.
         std.posix.tcsetattr(self.fd, .NOW, self.saved) catch {};
         g_saved = null;
         setSignals(std.posix.SIG.DFL);
-        self.active = false;
     }
 
-    /// Non-blocking single-key read; null when no key is pending.
-    pub fn poll(self: *RawTerminal) ?u8 {
+    pub fn readKey(self: *RawTerminal) ?u8 {
         var buf: [1]u8 = undefined;
         const n = std.posix.read(self.fd, &buf) catch return null;
         if (n == 0) {
@@ -156,6 +152,48 @@ pub const RawTerminal = struct {
             return null;
         }
         return buf[0];
+    }
+
+    pub const Fd = std.posix.fd_t;
+    pub const Termios = std.posix.termios;
+} else struct {
+    fn termSize() ?struct { rows: usize, cols: usize } {
+        return null;
+    }
+    pub fn enableRaw() !RawTerminal {
+        return .{ .fd = {}, .saved = {}, .active = false, .eof = true };
+    }
+    pub fn restoreRaw(_: *RawTerminal) void {}
+    pub fn readKey(_: *RawTerminal) ?u8 {
+        return null;
+    }
+    pub const Fd = void;
+    pub const Termios = void;
+};
+
+const termSize = term.termSize;
+
+pub const RawTerminal = struct {
+    fd: term.Fd,
+    saved: term.Termios,
+    active: bool,
+    /// Set when a non-raw (non-tty) stdin reaches EOF — the caller should quit
+    /// rather than spin (a closed stdin can never deliver a quit key).
+    eof: bool = false,
+
+    pub fn enable() !RawTerminal {
+        return term.enableRaw();
+    }
+
+    pub fn restore(self: *RawTerminal) void {
+        if (!self.active) return;
+        term.restoreRaw(self);
+        self.active = false;
+    }
+
+    /// Non-blocking single-key read; null when no key is pending.
+    pub fn poll(self: *RawTerminal) ?u8 {
+        return term.readKey(self);
     }
 };
 

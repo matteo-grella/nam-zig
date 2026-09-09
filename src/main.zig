@@ -22,29 +22,45 @@ const midi_mod = @import("midi.zig");
 const live_mod = @import("live.zig");
 const gguf_compat = @import("gguf_compat.zig");
 const ui = @import("ui.zig");
+const profiles_mod = @import("profiles.zig");
+const home_mod = @import("home.zig");
+const gui_mod = @import("gui.zig");
+const web = @import("web.zig");
+const discoverProfiles = profiles_mod.discoverProfiles;
+const stripProfileExt = profiles_mod.stripProfileExt;
+const buildChains = profiles_mod.buildChains;
+const loadModel = profiles_mod.loadModel;
 
 const usage =
     \\nam-zig: Neural Amp Modeler in Zig (see README.md)
     \\
     \\usage: nam-zig <command> [args]
     \\       (zig build run -Doptimize=ReleaseFast -- <command> [args] from a checkout;
-    \\        run with no command for the interactive amp menu)
+    \\        no command: the window when launched from the desktop, the amp menu in a terminal)
     \\
     \\play:
+    \\  gui [--port N] [--no-window] [--no-open] [--period N]
+    \\      the window: profiles from the nam-zig folder, devices, knobs, meters, tuner
     \\  live [<profile>...] [--ir cab.wav] [--chain rig.chain] [--capture N] [--playback N]
     \\       [--rate 48000] [--period 128] [--gain dB] [--input-gain dB] [--no-normalize]
     \\       [--gate dB] [--auto-input] [--midi N | --no-midi] [--midi-channel C] [--midi-map ...]
-    \\      play a guitar through profiles and/or chains in realtime
+    \\      play a guitar through profiles and/or chains in the terminal
     \\  render <model> <input.wav> <output.wav> [--blocksize N] [--no-prewarm] [--ir cab.wav]
     \\      offline file processing (matches upstream tools/render); --ir appends a cab
     \\  bench <model> [--blocksize N] [--seconds S]
     \\      per-block cost vs the realtime budget (use -Doptimize=ReleaseFast)
     \\  devices
     \\      list capture/playback devices and MIDI sources with indices
+    \\  doctor [--no-tone] [--download]
+    \\      check the folder, the capture signal (--download fetches it), the microphone permission,
+    \\      devices, and play a test tone
+    \\  open
+    \\      open the nam-zig folder (profiles, captures, settings) in the file manager
     \\
     \\profile / train:
-    \\  profile --signal s.wav --reamp-out r.wav --out m.nam [--capture N] [--playback N] [...]
-    \\      one-step reamp capture + train + export
+    \\  profile [--signal s.wav] [--reamp-out r.wav] [--out m.nam] [--capture N] [--playback N] [...]
+    \\      one-step reamp capture + train + export (the capture signal is downloaded when missing;
+    \\      the profile lands in the nam-zig folder)
     \\  train --input in.wav --output reamp.wav --out m.nam [--spec standard|tiny|a2|a2-nano|packed | --init model.nam] [...]
     \\      train a WaveNet from an existing pair; default is standard, --init fine-tunes a supported WaveNet
     \\  validate <model> --input in.wav --output reamp.wav [--write-wavs dir]
@@ -52,7 +68,7 @@ const usage =
     \\
     \\manage / interchange:
     \\  inspect <model.nam|.gguf>                 print structure + metadata
-    \\  list [--profiles-dir d]                   list profiles in ./nam-profiles ($NAM_ZIG_PROFILES)
+    \\  list [--profiles-dir d]                   list the profiles in the nam-zig folder ($NAM_ZIG_HOME)
     \\  export-gguf / import-gguf                 lossless .nam <-> GGUF interchange
     \\  loopback-test --capture N --playback N    measure the true round-trip latency
     \\
@@ -62,14 +78,20 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     const io = init.io;
+    const env = init.environ_map;
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
     defer stdout.flush() catch {};
 
-    if (args.len < 2) {
-        return interactive(io, allocator, stdout) catch |err| switch (err) {
+    // No command: launched from the desktop (Finder passes a -psn token on
+    // older macOS; stdin is not a terminal) -> the window; from a terminal
+    // -> the amp menu.
+    if (args.len < 2 or std.mem.startsWith(u8, args[1], "-psn")) {
+        const in_terminal = std.Io.File.stdin().isTty(io) catch false;
+        if (!in_terminal) return gui(io, allocator, stdout, env, &.{});
+        return interactive(io, allocator, stdout, env) catch |err| switch (err) {
             error.NoProfilesFound => {},
             else => return err,
         };
@@ -91,13 +113,19 @@ pub fn main(init: std.process.Init) !void {
     else if (std.mem.eql(u8, command, "validate"))
         validate(io, allocator, stdout, args[2..])
     else if (std.mem.eql(u8, command, "list"))
-        listProfiles(io, allocator, stdout, args[2..])
+        listProfiles(io, allocator, stdout, env, args[2..])
     else if (std.mem.eql(u8, command, "export-gguf"))
         exportGguf(io, allocator, stdout, args[2..])
     else if (std.mem.eql(u8, command, "import-gguf"))
         importGguf(io, allocator, stdout, args[2..])
     else if (std.mem.eql(u8, command, "profile"))
-        profileCapture(io, allocator, stdout, args[2..])
+        profileCapture(io, allocator, stdout, env, args[2..])
+    else if (std.mem.eql(u8, command, "gui"))
+        gui(io, allocator, stdout, env, args[2..])
+    else if (std.mem.eql(u8, command, "doctor"))
+        doctor(io, allocator, stdout, env, args[2..])
+    else if (std.mem.eql(u8, command, "open"))
+        openHome(io, allocator, stdout, env)
     else if (std.mem.eql(u8, command, "loopback-test"))
         loopbackTest(io, allocator, stdout, args[2..])
     else if (std.mem.eql(u8, command, "devices"))
@@ -126,14 +154,6 @@ pub fn main(init: std.process.Init) !void {
         },
         else => return err,
     };
-}
-
-fn loadModel(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, path: []const u8) !nam_file.NamModel {
-    const model = try gguf_compat.loadAny(io, allocator, path);
-    if (model.partial_support) {
-        try stdout.print("note: {s} has a newer patch version than 0.7.0; loading with partial support (same as upstream)\n", .{path});
-    }
-    return model;
 }
 
 /// Returns the value following the current flag, advancing `i`. Errors instead
@@ -938,7 +958,8 @@ fn validate(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, ar
     }
 }
 
-fn profilesDirPath(allocator: std.mem.Allocator, args: []const []const u8) error{MissingArgumentValue}![]const u8 {
+/// `--profiles-dir`, else the home folder's profiles directory.
+fn profilesDirPath(allocator: std.mem.Allocator, io: std.Io, env: *const home_mod.Env, args: []const []const u8) ![]const u8 {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--profiles-dir")) {
@@ -947,17 +968,14 @@ fn profilesDirPath(allocator: std.mem.Allocator, args: []const []const u8) error
             return args[i];
         }
     }
-    _ = allocator;
-    if (std.c.getenv("NAM_ZIG_PROFILES")) |env| {
-        return std.mem.span(env);
-    }
-    return "nam-profiles";
+    const home = try home_mod.Home.resolve(allocator, io, env);
+    return home.profiles;
 }
 
-fn listProfiles(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, args: []const []const u8) !void {
-    const dir_path = try profilesDirPath(allocator, args);
+fn listProfiles(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, env: *const home_mod.Env, args: []const []const u8) !void {
+    const dir_path = try profilesDirPath(allocator, io, env, args);
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch {
-        try stdout.print("no profile directory at {s} (create it, or pass --profiles-dir / set $NAM_ZIG_PROFILES)\n", .{dir_path});
+        try stdout.print("no profile directory at {s} (create it, or pass --profiles-dir / set $NAM_ZIG_HOME)\n", .{dir_path});
         return;
     };
     defer dir.close(io);
@@ -1031,7 +1049,7 @@ fn captureCallback(user: ?*anyopaque, output: ?[*]f32, input: ?[*]const f32, fra
     state.cursor.store(pos, .release);
 }
 
-fn profileCapture(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, args: []const []const u8) !void {
+fn profileCapture(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, env: *const home_mod.Env, args: []const []const u8) !void {
     var signal_path: ?[]const u8 = null;
     var reamp_path: ?[]const u8 = null;
     var capture_index: ?usize = null;
@@ -1039,6 +1057,8 @@ fn profileCapture(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writ
     var period: u32 = 256;
     var train_args: std.ArrayList([]const u8) = .empty;
     defer train_args.deinit(allocator);
+    var has_out = false;
+    var name: []const u8 = "my-amp";
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1055,12 +1075,31 @@ fn profileCapture(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writ
             period = try std.fmt.parseInt(u32, try nextArg(args, &i), 10);
         } else {
             // Everything else (incl. --out) passes through to train.
+            if (std.mem.eql(u8, arg, "--out")) has_out = true;
+            if (std.mem.eql(u8, arg, "--name") and i + 1 < args.len) name = args[i + 1];
             try train_args.append(allocator, arg);
         }
     }
-    if (signal_path == null or reamp_path == null) {
-        try stdout.writeAll("usage: nam-zig profile --signal capture.wav --reamp-out reamp.wav --out model.nam [--capture N] [--playback N] [--period 256] [train flags]\n");
+    if (std.mem.eql(u8, name, "--help") or (args.len > 0 and std.mem.eql(u8, args[0], "--help"))) {
+        try stdout.writeAll("usage: nam-zig profile [--signal capture.wav] [--reamp-out reamp.wav] [--out model.nam] [--capture N] [--playback N] [--period 256] [train flags]\n");
         return;
+    }
+
+    // Defaults live in the nam-zig folder: the standardized capture signal
+    // (downloaded once), the reamp recording under captures/, the profile
+    // under profiles/ where the window finds it.
+    const home = try home_mod.Home.resolve(allocator, io, env);
+    try home.ensure();
+    if (signal_path == null) signal_path = try home.ensureCaptureSignal(stdout);
+    const slug = try slugify(allocator, name);
+    if (reamp_path == null) reamp_path = try uniquePath(allocator, io, home.captures, slug, "-reamp.wav");
+    if (!has_out) {
+        try train_args.append(allocator, "--out");
+        try train_args.append(allocator, try uniquePath(allocator, io, home.profiles, slug, ".nam"));
+    }
+    if (gui_mod.micRequest(120_000) == .denied) {
+        try stdout.writeAll("error: microphone access is denied; allow it in System Settings, Privacy & Security, Microphone\n");
+        return error.MicrophoneDenied;
     }
 
     var signal_wav = try wav.readFile(io, allocator, signal_path.?);
@@ -1217,52 +1256,39 @@ fn loopbackTest(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer
 /// Zero-argument guided mode for non-experts: discover profiles, pick by
 /// number, and start playing with every decision pre-made (auto input
 /// detection, same-device output, loudness normalization, noise gate).
-fn interactive(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer) !void {
+fn interactive(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, env: *const home_mod.Env) !void {
     try stdout.writeAll(
         \\
-        \\  NAM — play your guitar through neural amp profiles
+        \\  nam-zig: play your guitar through neural amp profiles
         \\
     );
 
+    const home = try home_mod.Home.resolve(allocator, io, env);
+    home.ensure() catch {};
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(allocator);
+    try discoverProfiles(io, allocator, home.profiles, 3, &paths);
     const search_dirs = [_][]const u8{ "nam-profiles", "models", "." };
     for (search_dirs) |dir| try discoverProfiles(io, allocator, dir, 2, &paths);
 
     if (paths.items.len == 0) {
-        try stdout.writeAll(
+        try stdout.print(
             \\
             \\  No amp profiles found yet.
             \\
-            \\  Put .nam files in a folder named "nam-profiles" (or "models") next to
-            \\  this program. Thousands of free profiles: https://www.tone3000.com
-            \\  Then run this again.
+            \\  Put .nam files in {s}
+            \\  (the folder is open in your file manager now). Thousands of free
+            \\  profiles: https://www.tone3000.com
+            \\  Then run this again, or `nam-zig gui` for the window.
             \\
-        );
+            \\
+        , .{home.profiles});
+        try stdout.flush();
+        home.openInFileManager(home.profiles);
         return error.NoProfilesFound;
     }
 
-    std.mem.sort([]const u8, paths.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.ascii.lessThanIgnoreCase(std.fs.path.basename(a), std.fs.path.basename(b));
-        }
-    }.lessThan);
-
-    // Same profile in both formats: keep one entry (prefer the .nam).
-    var deduped: usize = 0;
-    for (paths.items) |path| {
-        const name = stripProfileExt(std.fs.path.basename(path));
-        if (deduped > 0) {
-            const previous = stripProfileExt(std.fs.path.basename(paths.items[deduped - 1]));
-            if (std.ascii.eqlIgnoreCase(name, previous)) {
-                if (std.ascii.endsWithIgnoreCase(path, ".nam")) paths.items[deduped - 1] = path;
-                continue;
-            }
-        }
-        paths.items[deduped] = path;
-        deduped += 1;
-    }
-    paths.items.len = deduped;
+    profiles_mod.sortAndDedupe(&paths);
 
     const shown = @min(paths.items.len, 30);
     try stdout.writeAll("\n  Which amp do you want to play?\n\n");
@@ -1302,44 +1328,6 @@ fn interactive(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer)
     );
     try stdout.flush();
     try live(io, allocator, stdout, live_args.items);
-}
-
-fn stripProfileExt(name: []const u8) []const u8 {
-    if (std.ascii.endsWithIgnoreCase(name, ".nam")) return name[0 .. name.len - 4];
-    if (std.ascii.endsWithIgnoreCase(name, ".gguf")) return name[0 .. name.len - 5];
-    return name;
-}
-
-fn isNamGguf(io: std.Io, allocator: std.mem.Allocator, path: []const u8) bool {
-    var file = fucina.gguf.File.loadMmap(allocator, io, path) catch return false;
-    defer file.deinit();
-    return file.getString(gguf_compat.file_json_key) != null;
-}
-
-/// Collects .nam/.gguf files under `dir` up to `depth` levels deep.
-fn discoverProfiles(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, depth: usize, out: *std.ArrayList([]const u8)) !void {
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
-    defer dir.close(io);
-    var it = dir.iterate();
-    while (it.next(io) catch null) |entry| {
-        if (entry.kind == .directory and depth > 1) {
-            if (entry.name.len > 0 and entry.name[0] == '.') continue;
-            if (std.mem.eql(u8, dir_path, ".") and (std.mem.eql(u8, entry.name, "nam-profiles") or std.mem.eql(u8, entry.name, "models"))) continue;
-            if (std.mem.eql(u8, dir_path, ".") and !std.mem.eql(u8, entry.name, "models")) continue;
-            const sub = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
-            try discoverProfiles(io, allocator, sub, depth - 1, out);
-            continue;
-        }
-        if (entry.kind != .file) continue;
-        const is_nam = std.ascii.endsWithIgnoreCase(entry.name, ".nam");
-        const is_gguf = std.ascii.endsWithIgnoreCase(entry.name, ".gguf");
-        if (!is_nam and !is_gguf) continue;
-        const path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
-        // .gguf is also the LLM weights format — only list NAM containers
-        // (metadata-only mmap peek; tensor data is never touched).
-        if (is_gguf and !isNamGguf(io, allocator, path)) continue;
-        try out.append(allocator, path);
-    }
 }
 
 fn devices(stdout: *std.Io.Writer, args: []const []const u8) !void {
@@ -1482,7 +1470,13 @@ fn live(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, args: 
     // Build every chain (bare profiles become 1-stage chains, +cab when --ir;
     // then explicit --chain manifests). Preloaded + prewarmed up front so
     // switching is one atomic index store.
-    var set = try buildChains(io, allocator, stdout, profile_paths[0..profile_count], ir_path, chain_paths[0..chain_count], options.sample_rate, frame_cap);
+    var set = try buildChains(io, allocator, stdout, .{
+        .profile_paths = profile_paths[0..profile_count],
+        .ir_path = ir_path,
+        .chain_paths = chain_paths[0..chain_count],
+        .sample_rate = options.sample_rate,
+        .frame_cap = frame_cap,
+    });
     defer set.deinit();
     try stdout.flush();
 
@@ -1502,153 +1496,244 @@ fn live(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, args: 
     try live_mod.run(io, allocator, &shared, &audio, options);
 }
 
-const BuiltStage = struct { cs: live_mod.ChainStage, norm_gain: f32 };
+/// A file-name stem from a free-text name: letters, digits, `-` and `_`.
+fn slugify(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    var out = try allocator.alloc(u8, @max(name.len, 1));
+    var n: usize = 0;
+    var last_dash = true;
+    for (name) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '_') {
+            out[n] = c;
+            n += 1;
+            last_dash = false;
+        } else if (!last_dash) {
+            out[n] = '-';
+            n += 1;
+            last_dash = true;
+        }
+    }
+    while (n > 0 and out[n - 1] == '-') n -= 1;
+    if (n == 0) {
+        out[0] = 'p';
+        n = 1;
+    }
+    return allocator.realloc(out, n);
+}
 
-/// Loads one stage instance (NAM model or cab IR) for `spec`, sized to
-/// `frame_cap` and prewarmed. The instance is heap-allocated for a stable
-/// pointer in the chain; on error it is fully cleaned up. `norm_gain` is the
-/// NAM stage's loudness comp to -18 dBFS (1.0 for a cab).
-fn buildStage(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, spec: chain_mod.StageSpec, sample_rate: u32, frame_cap: usize) !BuiltStage {
-    const trim = std.math.pow(f32, 10.0, spec.trim_db / 20.0);
-    switch (spec.kind) {
-        .nam => {
-            var model = try loadModel(io, allocator, stdout, spec.path);
-            defer model.deinit();
-            if (model.sample_rate > 0 and model.sample_rate != @as(f64, @floatFromInt(sample_rate))) {
-                try stdout.print("error: {s} expects {d} Hz but the stream is {d} Hz (no resampling; pass --rate)\n", .{ spec.path, model.sample_rate, sample_rate });
-                return error.SampleRateMismatch;
-            }
-            const engine = try allocator.create(engine_mod.Engine);
-            errdefer allocator.destroy(engine);
-            engine.* = try engine_mod.Engine.init(allocator, &model);
-            errdefer engine.deinit();
-            try engine.reset(frame_cap, true);
-            // Player-style loudness normalization to the -18 dBFS target (capped
-            // so bogus metadata can't blast the output). The engine itself never
-            // applies loudness, same as the upstream core.
-            var norm_gain: f32 = 1.0;
-            if (model.metadata.loudness) |loudness| {
-                const boost_db = std.math.clamp(-18.0 - loudness, -40.0, 20.0);
-                norm_gain = std.math.pow(f32, 10.0, @as(f32, @floatCast(boost_db)) / 20.0);
-            }
-            const gear = classifyGearModel(&model);
-            return .{ .cs = .{ .stage = .{ .nam = .{ .engine = engine, .gear = gear } }, .in_trim = trim }, .norm_gain = norm_gain };
-        },
-        .cab => {
-            const cab = try allocator.create(ir_cab.IrCab);
-            errdefer allocator.destroy(cab);
-            cab.* = ir_cab.IrCab.loadFile(io, allocator, spec.path, sample_rate, frame_cap) catch |err| {
-                try stdout.print("error: could not load cab IR {s}: {s}\n", .{ spec.path, @errorName(err) });
-                return err;
-            };
-            errdefer cab.deinit();
-            try stdout.print("cab IR: {s} ({d} taps @ {d} Hz)\n", .{ spec.path, cab.taps, sample_rate });
-            return .{ .cs = .{ .stage = .{ .cab = cab }, .in_trim = trim }, .norm_gain = 1.0 };
-        },
+/// `<dir>/<stem><suffix>`, or `<stem>-2<suffix>`, `-3`, ... when taken.
+fn uniquePath(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []const u8, suffix: []const u8) ![]const u8 {
+    var attempt: usize = 1;
+    while (attempt < 1000) : (attempt += 1) {
+        const file = if (attempt == 1)
+            try std.fmt.allocPrint(allocator, "{s}{s}", .{ stem, suffix })
+        else
+            try std.fmt.allocPrint(allocator, "{s}-{d}{s}", .{ stem, attempt, suffix });
+        const path = try std.fs.path.join(allocator, &.{ dir, file });
+        std.Io.Dir.cwd().access(io, path, .{}) catch return path;
+    }
+    return error.TooManyFiles;
+}
+
+test "slugify keeps letters, digits, underscores; folds the rest into single dashes" {
+    const allocator = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "My Amp", "My-Amp" },
+        .{ "  Deluxe / Reverb (crunch)!! ", "Deluxe-Reverb-crunch" },
+        .{ "plain_name", "plain_name" },
+        .{ "///", "p" },
+    };
+    for (cases) |c| {
+        const got = try slugify(allocator, c[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(c[1], got);
     }
 }
 
-/// Assembles all chains: bare profiles first (each a 1-stage chain, plus a cab
-/// stage when --ir is given), then explicit --chain manifests. Every stage is
-/// duplicate-loaded into its own instance (single-owner — see live.zig). On any
-/// failure everything built so far is freed.
-fn buildChains(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, profile_paths: []const []const u8, ir_path: ?[]const u8, chain_paths: []const []const u8, sample_rate: u32, frame_cap: usize) !live_mod.ChainSet {
-    var arena_inst = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena_inst.deinit();
-    const arena = arena_inst.allocator();
-
-    const total = profile_paths.len + chain_paths.len;
-    const chains = try allocator.alloc(live_mod.Chain, total);
-    errdefer allocator.free(chains);
-
-    var built: usize = 0;
-    var pending: std.ArrayList(live_mod.ChainStage) = .empty;
-    // Single-owner cleanup of the temporary buffer: frees exactly once on every
-    // exit (including if the success-path print below fails). Registered before
-    // the errdefer so on error the destroyStage loops (which read pending.items)
-    // run first, then this frees the buffer.
-    defer pending.deinit(allocator);
-    errdefer {
-        for (pending.items) |*cs| live_mod.destroyStage(allocator, cs);
-        for (chains[0..built]) |*c| for (c.stages) |*cs| live_mod.destroyStage(allocator, cs);
-    }
-
-    // (1) bare profiles -> 1-stage chains (+ optional --ir cab stage).
-    for (profile_paths) |ppath| {
-        const r = try buildStage(io, allocator, stdout, .{ .path = ppath, .kind = .nam }, sample_rate, frame_cap);
-        try pending.append(allocator, r.cs);
-        if (ir_path) |irp| {
-            const c = try buildStage(io, allocator, stdout, .{ .path = irp, .kind = .cab }, sample_rate, frame_cap);
-            try pending.append(allocator, c.cs);
-        }
-        const cname = std.fs.path.basename(ppath);
-        live_mod.adviseChain(stdout, cname, pending.items) catch {};
-        chains[built] = .{
-            .name = try arena.dupe(u8, cname),
-            .stages = try arena.dupe(live_mod.ChainStage, pending.items),
-            .norm_gain = r.norm_gain,
-        };
-        pending.clearRetainingCapacity(); // ownership moved into chains[built]
-        built += 1;
-    }
-
-    // (2) explicit --chain manifests.
-    for (chain_paths) |cpath| {
-        const text = try wav.readFileBytes(io, allocator, cpath);
-        defer allocator.free(text);
-        var spec = chain_mod.parse(allocator, text) catch |err| {
-            try stdout.print("error: bad chain manifest {s}: {s}\n", .{ cpath, @errorName(err) });
-            return err;
-        };
-        defer spec.deinit();
-        var norm: f32 = 1.0;
-        for (spec.stages) |sspec| {
-            const r = try buildStage(io, allocator, stdout, sspec, sample_rate, frame_cap);
-            if (sspec.kind == .nam) norm = r.norm_gain; // last NAM stage wins
-            try pending.append(allocator, r.cs);
-        }
-        const cname = spec.name orelse std.fs.path.stem(std.fs.path.basename(cpath));
-        live_mod.adviseChain(stdout, cname, pending.items) catch {};
-        chains[built] = .{
-            .name = try arena.dupe(u8, cname),
-            .stages = try arena.dupe(live_mod.ChainStage, pending.items),
-            .norm_gain = norm,
-        };
-        pending.clearRetainingCapacity();
-        built += 1;
-    }
-
-    try stdout.print("loaded {d} chain(s)\n", .{total});
-    return .{ .allocator = allocator, .arena = arena_inst, .chains = chains };
+fn openHome(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, env: *const home_mod.Env) !void {
+    const home = try home_mod.Home.resolve(allocator, io, env);
+    try home.ensure();
+    try stdout.print("{s}\n", .{home.root});
+    try stdout.flush();
+    home.openInFileManager(home.root);
 }
 
-/// gear_type-based cab classification + a Tone3000 "full rig" name/model hint.
-fn classifyGearModel(model: *const nam_file.NamModel) live_mod.GearClass {
-    var hint = false;
-    const doc = model.document();
-    if (doc == .object) {
-        if (doc.object.get("metadata")) |m| {
-            if (m == .object) {
-                for ([_][]const u8{ "name", "gear_model", "tone_type" }) |k| {
-                    if (m.object.get(k)) |v| {
-                        if (v == .string and hasFullRig(v.string)) hint = true;
-                    }
-                }
-            }
+/// The window: the session over the home folder's profiles, served to a
+/// native window (or the browser) from a loopback port.
+fn gui(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, env: *const home_mod.Env, args: []const []const u8) !void {
+    var port: u16 = 8790;
+    var open_window = true;
+    var open_anything = true;
+    var verbose = false;
+    var period: ?u32 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--port")) {
+            port = try std.fmt.parseInt(u16, try nextArg(args, &i), 10);
+        } else if (std.mem.eql(u8, arg, "--no-window")) {
+            open_window = false;
+        } else if (std.mem.eql(u8, arg, "--no-open")) {
+            open_window = false;
+            open_anything = false;
+        } else if (std.mem.eql(u8, arg, "--period")) {
+            period = try std.fmt.parseInt(u32, try nextArg(args, &i), 10);
+        } else if (std.mem.eql(u8, arg, "--verbose")) {
+            verbose = true;
+        } else {
+            try stdout.writeAll("usage: nam-zig gui [--port N] [--no-window] [--no-open] [--period N] [--verbose]\n");
+            return;
         }
     }
-    return live_mod.classifyGear(model.metadata.gear_type, hint);
+
+    // Headless (--no-open) runs have nobody to answer a permission prompt.
+    const app = try gui_mod.Gui.create(io, allocator, stdout, env, .{ .period = period, .request_mic = open_anything });
+    defer app.destroy();
+    var server = web.Server{ .io = io, .gui = app, .verbose = verbose };
+    try server.bind(port);
+    const server_thread = try std.Thread.spawn(.{}, web.Server.run, .{&server});
+    const tick_thread = try std.Thread.spawn(.{}, gui_mod.Gui.tickLoop, .{app});
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrintZ(&url_buf, "http://127.0.0.1:{d}/", .{server.port});
+    try stdout.print("nam-zig: {s}\n", .{url});
+    try stdout.flush();
+
+    if (open_window and gui_mod.windowSupported()) {
+        var watcher = gui_mod.QuitWatcher{ .gui = app };
+        const watcher_thread = try std.Thread.spawn(.{}, gui_mod.QuitWatcher.run, .{&watcher});
+        gui_mod.windowOpen(url, "nam-zig", 1040, 780);
+        app.requestQuit();
+        watcher_thread.join();
+    } else {
+        if (open_anything) home_mod.openExternal(io, url);
+        try stdout.writeAll("running: use the page's Quit button (or Ctrl-C) to stop\n");
+        try stdout.flush();
+        while (!app.quit.load(.acquire)) {
+            std.Io.sleep(io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+        }
+    }
+
+    server.stop();
+    server_thread.join();
+    tick_thread.join();
+    app.saveConfig();
 }
 
-fn hasFullRig(s: []const u8) bool {
-    if (std.ascii.indexOfIgnoreCase(s, "full-rig") != null) return true;
-    if (std.ascii.indexOfIgnoreCase(s, "full rig") != null) return true;
-    return std.ascii.indexOfIgnoreCase(s, "full") != null and std.ascii.indexOfIgnoreCase(s, "rig") != null;
+const ToneState = struct {
+    phase: f32 = 0,
+    step: f32,
+    remaining: std.atomic.Value(usize),
+};
+
+fn toneCallback(user: ?*anyopaque, output: ?[*]f32, input: ?[*]const f32, frame_count: c_uint) callconv(.c) void {
+    _ = input;
+    const state: *ToneState = @ptrCast(@alignCast(user.?));
+    const out = (output orelse return)[0..frame_count];
+    var remaining = state.remaining.load(.monotonic);
+    for (out) |*v| {
+        if (remaining == 0) {
+            v.* = 0;
+            continue;
+        }
+        v.* = 0.25 * @sin(state.phase);
+        state.phase += state.step;
+        if (state.phase > 2.0 * std.math.pi) state.phase -= 2.0 * std.math.pi;
+        remaining -= 1;
+    }
+    state.remaining.store(remaining, .monotonic);
+}
+
+/// Checks everything a first run depends on and prints one line per item.
+fn doctor(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, env: *const home_mod.Env, args: []const []const u8) !void {
+    var play_tone = true;
+    var download = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--no-tone")) play_tone = false;
+        if (std.mem.eql(u8, arg, "--download")) download = true;
+    }
+    const home = try home_mod.Home.resolve(allocator, io, env);
+    home.ensure() catch |err| try stdout.print("folder:      cannot create {s} ({s})\n", .{ home.root, @errorName(err) });
+    if (download) _ = home.ensureCaptureSignal(stdout) catch {};
+
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(allocator);
+    try discoverProfiles(io, allocator, home.profiles, 3, &paths);
+    profiles_mod.sortAndDedupe(&paths);
+    var chains: std.ArrayList([]const u8) = .empty;
+    defer chains.deinit(allocator);
+    try profiles_mod.discoverChains(io, allocator, home.profiles, 3, &chains);
+    try stdout.print("folder:      {s}\n", .{home.root});
+    try stdout.print("profiles:    {d} profile(s), {d} chain manifest(s) in {s}\n", .{ paths.items.len, chains.items.len, home.profiles });
+    if (paths.items.len == 0) try stdout.writeAll("             none yet: drop .nam files there (https://www.tone3000.com)\n");
+
+    if (home.exists(home.signal_path)) {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, home.signal_path, allocator, .limited(256 * 1024 * 1024)) catch &.{};
+        defer allocator.free(bytes);
+        const exact = data.detectInputVersion(bytes) == .v3_0_0;
+        try stdout.print("capture:     v3_0_0.wav {s}\n", .{if (exact) "present, checksum verified" else "present but NOT the exact v3 file (profile re-downloads it)"});
+    } else {
+        try stdout.writeAll("capture:     v3_0_0.wav not downloaded yet (`nam-zig profile` fetches it)\n");
+    }
+
+    const config = home_mod.Config.load(allocator, io, home.config_path) catch home_mod.Config{};
+    if (config.capture != null or config.playback != null or config.chain != null) {
+        try stdout.print("settings:    input \"{s}\", output \"{s}\", profile \"{s}\" ({s})\n", .{ config.capture orelse "default", config.playback orelse "default", config.chain orelse "-", home.config_path });
+    } else {
+        try stdout.writeAll("settings:    none saved yet (the window saves them)\n");
+    }
+
+    switch (gui_mod.micStatus()) {
+        .authorized => try stdout.writeAll("microphone:  authorized\n"),
+        .denied => try stdout.writeAll("microphone:  DENIED: allow nam-zig (or your terminal) in System Settings, Privacy & Security, Microphone\n"),
+        .undetermined => try stdout.writeAll("microphone:  not asked yet (the prompt appears when the input opens)\n"),
+    }
+    try stdout.print("window:      {s}\n", .{if (gui_mod.windowSupported()) "native window available" else "no native window on this system: the page opens in the browser"});
+
+    var audio = audio_mod.Audio.init() catch {
+        try stdout.writeAll("audio:       could not initialize the audio backend\n");
+        return;
+    };
+    defer audio.deinit();
+    var storage: [audio_mod.max_devices]audio_mod.DeviceInfo = undefined;
+    const captures = try audio.listDevices(.capture, &storage);
+    try stdout.print("inputs:      {d} device(s)\n", .{captures.len});
+    for (captures, 0..) |*info, index| try stdout.print("             [{d}] {s}{s}\n", .{ index, info.nameSlice(), if (info.is_default) " (default)" else "" });
+    const playbacks = try audio.listDevices(.playback, &storage);
+    try stdout.print("outputs:     {d} device(s)\n", .{playbacks.len});
+    for (playbacks, 0..) |*info, index| try stdout.print("             [{d}] {s}{s}\n", .{ index, info.nameSlice(), if (info.is_default) " (default)" else "" });
+    if (midi_mod.Midi.init()) |*m| {
+        var midi = m.*;
+        defer midi.deinit();
+        var midi_storage: [midi_mod.max_sources]midi_mod.SourceInfo = undefined;
+        const sources = midi.listSources(&midi_storage);
+        try stdout.print("midi:        {d} source(s)\n", .{sources.len});
+        for (sources, 0..) |*info, index| try stdout.print("             [{d}] {s}\n", .{ index, info.nameSlice() });
+    } else |_| {
+        try stdout.writeAll("midi:        no MIDI backend on this platform (keyboard and window controls only)\n");
+    }
+    try stdout.flush();
+
+    if (play_tone and playbacks.len > 0) {
+        const rate: u32 = 48000;
+        var state = ToneState{ .step = 2.0 * std.math.pi * 440.0 / @as(f32, @floatFromInt(rate)), .remaining = .init(rate) };
+        audio.startPlayback(null, rate, 256, toneCallback, &state) catch |err| {
+            try stdout.print("test tone:   failed to open the default output ({s})\n", .{@errorName(err)});
+            return;
+        };
+        var waited_ms: usize = 0;
+        while (state.remaining.load(.monotonic) > 0 and waited_ms < 4000) : (waited_ms += 50) {
+            std.Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
+        }
+        audio.stop();
+        try stdout.print("test tone:   {s}\n", .{if (state.remaining.load(.monotonic) == 0) "played 1 s at 440 Hz on the default output" else "the output did not consume the tone (device stalled?)"});
+    }
 }
 
 const rng = fucina.rng;
 
 test {
+    _ = @import("profiles.zig");
+    _ = @import("home.zig");
     _ = @import("wav.zig");
     _ = @import("nam_file.zig");
     _ = @import("wavenet.zig");

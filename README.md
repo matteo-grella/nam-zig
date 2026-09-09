@@ -5,7 +5,58 @@ ecosystem, written in Zig on the [Fucina](https://github.com/matteo-grella/fucin
 library: load and play `.nam` amp profiles live (optionally with cabinet IRs and
 multi-stage signal chains), create your own profiles from captured audio, and exchange
 profiles with the original NAM tooling in both directions. No plugin host or DAW is
-required: it runs against your normal audio devices from the terminal.
+required: it runs against your normal audio devices, from a window or from the terminal.
+
+## Install
+
+Download the build for your platform from the
+[releases page](https://github.com/matteo-grella/nam-zig/releases) and unzip it.
+
+| Platform | What you get | How to start |
+| --- | --- | --- |
+| macOS (Apple Silicon or Intel) | `nam-zig.app` plus the command-line binary in `bin/` | Double-click `nam-zig.app`. The first time, macOS may say the app is from an unidentified developer: open System Settings, Privacy & Security, scroll down and choose Open Anyway. |
+| Linux (x86_64, aarch64) | the `nam-zig` binary | Run `./nam-zig`. The window needs GTK 3 and WebKitGTK (present on most desktops); without them the page opens in your browser. |
+| Windows (x86_64) | `nam-zig.exe` | Run `nam-zig.exe`; the page opens in your browser. |
+
+The app needs permission to use the microphone (that is how it hears your guitar
+interface): allow it when asked. Nothing else is installed; everything lives in the
+folder described below.
+
+## First run
+
+1. **Open the app.** A window appears and a folder named `nam-zig` is created inside
+   your `Music` folder, with a `profiles` subfolder. Press **Open folder** to see it.
+2. **Get a profile.** Download any `.nam` file: [Tone3000](https://www.tone3000.com)
+   hosts thousands of free ones (they are almost all "standard WaveNet", which this player
+   runs at full fidelity). A profile made with the official NAM trainer works too.
+   Tone3000 also hosts cabinet IRs (`.wav`).
+3. **Drop the files in `profiles`** and press **Rescan**. Every `.nam` in the folder
+   becomes an entry in the list; `.wav` cabinet IRs and `.chain` manifests (see
+   [Cabinet IRs and signal chains](#cabinet-irs-and-signal-chains)) are picked up too.
+4. **Pick your input and output** in the Devices section (the audio interface your guitar
+   is plugged into; see [Hardware](#hardware-what-plugs-into-what) for how to connect it),
+   or press **Auto-detect input** and keep playing: it listens to every input for a
+   moment and picks the one carrying your guitar.
+5. **Play.** Click a profile to switch amps. The knobs: input drive (how hard you hit the
+   amp, which changes the tone), output gain, a noise gate with its threshold, loudness
+   normalization across profiles, bypass, mute, and a chromatic tuner.
+
+Your device choice, profile, and knob positions are saved in `nam-zig/config.txt` and
+restored next time. `nam-zig doctor` (from a terminal) checks the folder, the microphone
+permission, the devices, and plays a test tone; `nam-zig open` opens the folder.
+
+If you hear nothing: on macOS a denied microphone permission yields silence with no error;
+allow nam-zig (or, for the terminal commands, your terminal app) in System Settings,
+Privacy & Security, Microphone. Monitor through headphones or speakers on the same
+interface you capture with: one device means one sample clock.
+
+## Capture your own amp
+
+`nam-zig profile` plays the standardized capture signal through your rig, records what
+comes back, trains a profile, and saves it into your `profiles` folder. The capture signal
+(`v3_0_0.wav`) is downloaded once into the `nam-zig` folder, checksum verified. See
+[Profiling an amp or pedal](#profiling-an-amp-or-pedal-profile--train) for the wiring and
+the command.
 
 ## Built on Fucina
 
@@ -15,16 +66,18 @@ sequence op, and training runs on its autograd engine and optimizers, so one mod
 definition both trains and plays. `build.zig.zon` pins the Fucina release; `zig build`
 fetches it.
 
-## Getting started (5 minutes to first sound)
+## Build from source
 
 **Prerequisites:** [Zig 0.16.0](https://ziglang.org/download/) and git. Developed and
-tested on macOS / Apple Silicon. Linux builds and passes the test suite in CI; live audio
-on Linux is untested. The Fucina dependency is fetched by the Zig package manager at build
-time (pinned by tag and content hash in `build.zig.zon`); there are no other dependencies.
+tested on macOS / Apple Silicon; Linux and Windows build and pass the test suite in CI
+(live audio there is exercised by users, not by CI). The Fucina dependency is fetched by
+the Zig package manager at build time (pinned by tag and content hash in `build.zig.zon`);
+there are no other dependencies.
 
 ```sh
 git clone https://github.com/matteo-grella/nam-zig && cd nam-zig
 zig build -Doptimize=ReleaseFast        # builds zig-out/bin/nam-zig
+zig build app -Doptimize=ReleaseFast    # macOS: also assembles zig-out/nam-zig.app
 ```
 
 `-Doptimize=ReleaseFast` matters: debug builds are ~20× slower and will not keep up in
@@ -34,22 +87,15 @@ directly (`zig-out/bin/nam-zig <command>`); the examples below use the short for
 `zig build test` runs the unit tests, and `-Dblas=none` builds without any system BLAS
 library (Fucina links Accelerate on macOS by default).
 
-**The simplest path, no flags at all:** put your `.nam` files in a folder named
-`nam-profiles` (or `models`) next to the program, plug the guitar into your interface,
-and run
+## The terminal player
 
-```sh
-zig build run -Doptimize=ReleaseFast
-```
+`nam-zig gui` opens the window from a terminal (`--no-window` serves the page to your
+browser instead, `--port N` picks the port). With no command, `nam-zig` in a terminal
+shows a numbered amp menu over the profiles in your folder (and in a `nam-profiles` or
+`models` folder next to the binary); pick one, keep playing while it auto-detects the
+input, and you're live. Everything below is the manual/expert path through `live`.
 
-You get a numbered amp menu; pick one, keep playing while it auto-detects the right
-input, and you're live: input detection, same-device output, loudness normalization,
-and the noise gate are all pre-configured. Everything below is the manual/expert path.
-
-1. **Get a profile.** Download any `.nam` file: [Tone3000](https://www.tone3000.com)
-   hosts thousands of free ones (they are almost all "standard WaveNet", which this player
-   runs at full fidelity). A profile made with the official NAM trainer works too.
-   Tone3000 also hosts cabinet IRs (`.wav`); add one with `--ir` (see
+1. **Get a profile** as above; add a cabinet IR with `--ir` (see
    [Cabinet IRs and signal chains](#cabinet-irs-and-signal-chains)).
 2. **Find your audio interface:**
    ```sh
@@ -96,10 +142,6 @@ and the noise gate are all pre-configured. Everything below is the manual/expert
    chosen an output, offered as a one-key suggestion (`y` to accept). Otherwise: if the
    `in` meter stays at −140 dB while you play, press `i` to cycle inputs; if `in` moves
    but you hear nothing, cycle the output with `o`.
-
-If you hear nothing: on macOS the microphone permission is attributed to your **terminal
-app**: a denied permission yields silence with no error. Check System Settings → Privacy →
-Microphone.
 
 ## Hardware: what plugs into what
 
@@ -167,12 +209,13 @@ official NAM trainer uses). It is recognized by checksum and enables automatic l
 calibration (from its blips) and the quality pre-checks. Then:
 
 ```sh
-nam-zig profile --signal v3_0_0.wav --reamp-out reamp.wav \
-    --out my-amp.nam --capture 2 --playback 2 \
-    --name "My Amp" --gear-type amp --tone-type crunch
+nam-zig profile --capture 2 --playback 2 --name "My Amp" --gear-type amp --tone-type crunch
 ```
 
-plays the file through your rig, records the return, saves it, and trains. Alternatively
+downloads the capture signal on first use (into the `nam-zig` folder), plays it through
+your rig, records the return under `captures/`, and trains; the profile lands in
+`profiles/` as `My-Amp.nam`, where the window lists it. `--signal`, `--reamp-out`, and
+`--out` override those paths. Alternatively
 record the reamp in your DAW and run the two-step version:
 `nam-zig train --input v3_0_0.wav --output reamp.wav --out my-amp.nam`. Any other
 48 kHz input/output pair also works (pass `--latency` if your interface loopback delay is
@@ -301,16 +344,19 @@ Captures with no `gear_type`, and pedal-only chains, are left alone.
 
 | Command | What it does |
 | --- | --- |
+| `gui [--port N] [--no-window] [--no-open] [--period N]` | The window over the profiles in your `nam-zig` folder (the default when launched from the desktop). |
+| `doctor [--no-tone] [--download]` | Check the folder, the capture signal (`--download` fetches it), the microphone permission, devices, and play a test tone. |
+| `open` | Open the `nam-zig` folder in the file manager. |
 | `devices` | List capture/playback devices and MIDI sources with indices. |
 | `live [<profile>...] [--ir cab.wav] [--chain rig.chain] [--capture N] [--playback N] [--rate 48000] [--period 128] [--tuner] [--a4 440] [--midi N \| --no-midi] [--midi-channel C] [--midi-map ...]` | Play through profiles and/or chains (see [Cabinet IRs and signal chains](#cabinet-irs-and-signal-chains)). |
-| `profile --signal s.wav --reamp-out r.wav --out m.nam [...]` | One-step capture + train + export. |
+| `profile [--signal s.wav] [--reamp-out r.wav] [--out m.nam] [...]` | One-step capture + train + export; the defaults download the capture signal and save into the `nam-zig` folder. |
 | `train --input in.wav --output reamp.wav --out m.nam [...]` | Train from an existing pair. |
 | `validate <model> --input in.wav --output reamp.wav [--write-wavs dir]` | ESR + A/B WAVs. |
 | `inspect <model.nam\|.gguf>` | Print structure + metadata. |
 | `render <model> <in.wav> <out.wav> [--blocksize N] [--ir cab.wav]` | Offline file processing (matches upstream `tools/render`; `--ir` appends a cab). |
 | `bench <model> [--blocksize N]` | Per-block cost vs the realtime budget. |
 | `bench --train-step <spec> [--ny N]` | One training step (segment loss + backward) at the trainer's window shape. |
-| `list [--profiles-dir d]` | Profiles in `./nam-profiles` (or `$NAM_ZIG_PROFILES`). |
+| `list [--profiles-dir d]` | The profiles in your `nam-zig` folder (or another directory). |
 | `export-gguf` / `import-gguf` | Lossless GGUF interchange (byte-identical `.nam` recovery). |
 
 ## Compatibility guarantees
@@ -390,6 +436,18 @@ Captures with no `gear_type`, and pedal-only chains, are left alone.
    advisories printed at load.
 
 Module layout is described in the module doc comments of `src/*.zig`.
+
+## The nam-zig folder
+
+Everything the app keeps is in one folder: `Music/nam-zig` in your home directory
+(`NAM_ZIG_HOME` overrides the location).
+
+| Path | Content |
+| --- | --- |
+| `profiles/` | your `.nam` profiles, cabinet IR `.wav` files, and `.chain` manifests (subfolders are scanned too) |
+| `captures/` | the reamp recordings made by `profile` |
+| `config.txt` | the saved settings: devices, profile, gains, gate, normalization, period; plain `key=value` lines |
+| `v3_0_0.wav` | the standardized capture signal, downloaded once by `profile` or `doctor --download` |
 
 ## Command help and format range
 

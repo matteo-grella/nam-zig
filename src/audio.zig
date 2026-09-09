@@ -19,6 +19,7 @@ extern fn nam_audio_destroy(audio: ?*NamAudio) void;
 extern fn nam_audio_list_devices(audio: ?*NamAudio, kind: c_int, name_buf: [*]u8, name_cap_arg: c_int, default_flags: [*]u8, cap: c_int) c_int;
 extern fn nam_audio_start(audio: ?*NamAudio, capture_index: c_int, playback_index: c_int, sample_rate: c_uint, period_frames: c_uint, callback: RawCallback, user: ?*anyopaque) c_int;
 extern fn nam_audio_start_capture(audio: ?*NamAudio, capture_index: c_int, sample_rate: c_uint, period_frames: c_uint, callback: RawCallback, user: ?*anyopaque) c_int;
+extern fn nam_audio_start_playback(audio: ?*NamAudio, playback_index: c_int, sample_rate: c_uint, period_frames: c_uint, callback: RawCallback, user: ?*anyopaque) c_int;
 extern fn nam_audio_stop(audio: ?*NamAudio) void;
 extern fn nam_audio_actual_sample_rate(audio: ?*NamAudio) c_uint;
 extern fn nam_audio_internal_sample_rate(audio: ?*NamAudio, kind: c_int) c_uint;
@@ -88,6 +89,17 @@ pub const Audio = struct {
     pub fn startCapture(self: *Audio, capture: usize, sample_rate: u32, period_frames: u32, callback: RawCallback, user: ?*anyopaque) !void {
         const rc = nam_audio_start_capture(self.handle, @intCast(capture), sample_rate, period_frames, callback, user);
         if (rc != 0) return error.CaptureStart;
+    }
+
+    /// Playback-only stream (test tone); the callback sees input == null.
+    pub fn startPlayback(self: *Audio, playback: ?usize, sample_rate: u32, period_frames: u32, callback: RawCallback, user: ?*anyopaque) !void {
+        const rc = nam_audio_start_playback(self.handle, if (playback) |p| @intCast(p) else -1, sample_rate, period_frames, callback, user);
+        if (rc != 0) return switch (rc) {
+            -3 => error.DeviceIndexOutOfRange,
+            -4 => error.DeviceInit,
+            -5 => error.DeviceStart,
+            else => error.PlaybackStart,
+        };
     }
 
     pub fn stop(self: *Audio) void {

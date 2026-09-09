@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nam-zig</title>
+<style>
+  :root { color-scheme: dark; --bg:#14161a; --panel:#1d2026; --line:#2c3038; --text:#e6e8eb; --muted:#8b919b; --accent:#f0a030; --ok:#4cc38a; --warn:#e5484d; --meter:#3d6fd9; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font: 14px/1.4 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-user-select:none; user-select:none; }
+  header { display:flex; align-items:center; gap:14px; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { font-size:16px; margin:0; letter-spacing:.3px; }
+  header .status { color:var(--muted); font-size:12px; flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  main { display:grid; grid-template-columns: 260px 1fr; gap:14px; padding:14px 16px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.8px; color:var(--muted); margin:0 0 10px; }
+  #profiles { display:flex; flex-direction:column; gap:4px; max-height:60vh; overflow:auto; }
+  #profiles button { text-align:left; padding:8px 10px; background:transparent; border:1px solid transparent; color:var(--text); border-radius:6px; cursor:pointer; font-size:13px; }
+  #profiles button:hover { border-color:var(--line); }
+  #profiles button.active { background:#2a2f38; border-color:var(--accent); }
+  .empty { color:var(--muted); font-size:13px; }
+  .empty a { color:var(--accent); }
+  .right { display:flex; flex-direction:column; gap:14px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .meters { display:grid; grid-template-columns: 40px 1fr 64px; gap:8px 10px; align-items:center; }
+  .bar { height:14px; background:#0f1114; border-radius:3px; overflow:hidden; border:1px solid var(--line); }
+  .bar > i { display:block; height:100%; width:0; background:var(--meter); transition: width 80ms linear; }
+  .bar > i.hot { background:var(--accent); }
+  .db { font-variant-numeric: tabular-nums; color:var(--muted); font-size:12px; text-align:right; }
+  .toggle { padding:7px 12px; border-radius:6px; border:1px solid var(--line); background:#22262e; color:var(--text); cursor:pointer; font-size:13px; }
+  .toggle.on { background:var(--accent); color:#111; border-color:var(--accent); }
+  .toggle.danger.on { background:var(--warn); color:#fff; border-color:var(--warn); }
+  .slider { display:grid; grid-template-columns: 110px 1fr 70px; gap:10px; align-items:center; margin:6px 0; }
+  .slider label { color:var(--muted); font-size:13px; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  select { width:100%; padding:7px 8px; background:#22262e; color:var(--text); border:1px solid var(--line); border-radius:6px; font-size:13px; }
+  .devices { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
+  .devices label { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }
+  .note { color:var(--muted); font-size:12px; margin-top:8px; min-height:16px; }
+  .warn { color:var(--warn); font-weight:600; }
+  #tuner { font-variant-numeric: tabular-nums; }
+  #tuner .needle { position:relative; height:10px; background:#0f1114; border:1px solid var(--line); border-radius:3px; margin:8px 0; }
+  #tuner .needle > i { position:absolute; top:-3px; width:3px; height:14px; background:var(--accent); left:50%; }
+  #tuner .needle > b { position:absolute; left:50%; top:0; width:1px; height:100%; background:var(--line); }
+  #tuner .big { font-size:28px; font-weight:600; }
+  .strings { display:grid; grid-template-columns: repeat(6, 1fr); gap:6px; text-align:center; font-size:12px; color:var(--muted); }
+  .strings b { display:block; font-size:16px; color:var(--text); }
+  .strings .in { color:var(--ok); }
+  footer { display:flex; gap:10px; justify-content:flex-end; padding:0 16px 14px; }
+  .btn { padding:7px 12px; border-radius:6px; border:1px solid var(--line); background:#22262e; color:var(--text); cursor:pointer; font-size:13px; }
+  .btn:hover { border-color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>nam-zig</h1>
+  <div class="status" id="status">starting...</div>
+  <span id="clip" class="warn" hidden>CLIP</span>
+</header>
+<main>
+  <section>
+    <h2>Amp profiles</h2>
+    <div id="profiles"></div>
+    <div id="noprofiles" class="empty" hidden>
+      No profiles yet. Put <code>.nam</code> files (and cab IR <code>.wav</code> files or <code>.chain</code> manifests) in the profiles folder, then press Rescan.
+      Thousands of free profiles: <a href="https://www.tone3000.com" target="_blank" rel="noopener">tone3000.com</a>.
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn" onclick="act('open_folder=1')">Open folder</button>
+      <button class="btn" onclick="act('rescan=1')">Rescan</button>
+    </div>
+    <div class="note" id="folder"></div>
+  </section>
+  <div class="right">
+    <section>
+      <h2>Levels</h2>
+      <div class="meters">
+        <span>in</span><div class="bar"><i id="in_bar"></i></div><span class="db" id="in_db">-140 dB</span>
+        <span>out</span><div class="bar"><i id="out_bar"></i></div><span class="db" id="out_db">-140 dB</span>
+      </div>
+      <div class="note" id="silent"></div>
+    </section>
+    <section>
+      <h2>Controls</h2>
+      <div class="row">
+        <button class="toggle" id="bypass" onclick="toggle('bypass')">Bypass</button>
+        <button class="toggle danger" id="mute" onclick="toggle('mute')">Mute</button>
+        <button class="toggle" id="normalize" onclick="toggle('normalize')">Loudness normalize</button>
+        <button class="toggle" id="gate" onclick="toggle('gate')">Noise gate</button>
+        <button class="toggle" id="tuner_toggle" onclick="toggle('tuner')">Tuner</button>
+        <button class="btn" onclick="act('clear=1')">Clear clip</button>
+      </div>
+      <div class="slider"><label>Input drive</label><input type="range" id="in_trim_db" min="-20" max="40" step="1" oninput="slide('in_trim_db', this.value)"><span class="db" id="in_trim_lbl"></span></div>
+      <div class="slider"><label>Output gain</label><input type="range" id="out_gain_db" min="-40" max="24" step="1" oninput="slide('out_gain_db', this.value)"><span class="db" id="out_gain_lbl"></span></div>
+      <div class="slider"><label>Gate threshold</label><input type="range" id="gate_db" min="-90" max="-30" step="1" oninput="slide('gate_db', this.value)"><span class="db" id="gate_lbl"></span></div>
+    </section>
+    <section id="tuner" hidden>
+      <h2>Tuner</h2>
+      <div id="tuner_mono">
+        <div class="row"><span class="big" id="tuner_note">--</span><span class="db" id="tuner_cents"></span><span class="db" id="tuner_hz"></span></div>
+        <div class="needle"><b></b><i id="tuner_needle"></i></div>
+      </div>
+      <div class="strings" id="tuner_strings" hidden></div>
+    </section>
+    <section>
+      <h2>Devices</h2>
+      <div class="devices">
+        <div><label>Input (guitar interface)</label><select id="capture" onchange="act('capture='+this.value)"></select></div>
+        <div><label>Output</label><select id="playback" onchange="act('playback='+this.value)"></select></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" onclick="act('auto_input=1')">Auto-detect input (keep playing)</button>
+        <button class="btn" id="accept_twin" hidden onclick="act('accept_twin=1')">Use the same device for output</button>
+      </div>
+      <div class="note" id="note"></div>
+      <div class="note" id="mic"></div>
+    </section>
+  </div>
+</main>
+<footer>
+  <button class="btn" onclick="quit()">Quit</button>
+</footer>
+<script>
+const $ = id => document.getElementById(id);
+let state = null, dragging = null, stopped = false;
+function post(q) { return fetch('/api/set?' + q, { method: 'POST' }).then(r => r.json()).then(apply).catch(() => {}); }
+function act(q) { post(q); }
+function toggle(name) { if (!state) return; post(name + '=' + (state[name] ? 0 : 1)); }
+function slide(name, v) { dragging = name; clearTimeout(slide.t); slide.t = setTimeout(() => { dragging = null; }, 400); post(name + '=' + v); }
+function quit() { stopped = true; fetch('/api/quit', { method: 'POST' }).catch(() => {}); $('status').textContent = 'stopped. You can close this window.'; }
+function fmtDb(v) { return (v <= -139 ? '-inf' : v.toFixed(1)) + ' dB'; }
+function pct(db) { return Math.max(0, Math.min(100, (db + 60) / 60 * 100)); }
+function apply(s) {
+  if (!s || stopped) return;
+  state = s;
+  const dev = s.devices;
+  const cap = dev.capture_name || 'default input', pb = dev.playback_name || 'default output';
+  $('status').textContent = s.audio_running
+    ? cap + ' -> ' + pb + ' | ' + s.sample_rate + ' Hz | ' + s.period + ' frames | latency ~ ' + s.latency_ms.toFixed(1) + ' ms'
+    : (s.chains.length ? 'audio stopped: ' + (s.note || '') : 'no profiles loaded');
+  $('clip').hidden = !s.clipped;
+  $('in_bar').style.width = pct(s.in_db) + '%'; $('in_bar').className = s.in_db > -6 ? 'hot' : '';
+  $('out_bar').style.width = pct(s.out_db) + '%'; $('out_bar').className = s.out_db > -6 ? 'hot' : '';
+  $('in_db').textContent = fmtDb(s.in_db); $('out_db').textContent = fmtDb(s.out_db);
+  $('silent').textContent = s.silent ? 'No input signal for a while: pick another input, press Auto-detect, or check the microphone permission.' : '';
+  for (const k of ['bypass', 'mute', 'normalize', 'gate']) $(k).classList.toggle('on', !!s[k]);
+  $('tuner_toggle').classList.toggle('on', !!s.tuner.on);
+  for (const k of ['in_trim_db', 'out_gain_db', 'gate_db']) { if (dragging !== k) $(k).value = Math.round(s[k]); }
+  $('in_trim_lbl').textContent = s.in_trim_db.toFixed(0) + ' dB';
+  $('out_gain_lbl').textContent = s.out_gain_db.toFixed(0) + ' dB';
+  $('gate_lbl').textContent = s.gate_db.toFixed(0) + ' dB';
+  const list = $('profiles');
+  const sig = s.chains.join('');
+  if (list.dataset.sig !== sig) {
+    list.dataset.sig = sig;
+    list.innerHTML = '';
+    s.chains.forEach((name, i) => { const b = document.createElement('button'); b.textContent = name; b.onclick = () => act('chain=' + i); list.appendChild(b); });
+  }
+  [...list.children].forEach((b, i) => b.classList.toggle('active', i === s.chain_index));
+  $('noprofiles').hidden = s.chains.length > 0;
+  $('folder').textContent = s.profiles_dir;
+  fillSelect($('capture'), dev.capture, dev.capture_index);
+  fillSelect($('playback'), dev.playback, dev.playback_index);
+  $('accept_twin').hidden = !s.suggested_playback;
+  $('note').textContent = s.note || '';
+  $('mic').innerHTML = s.mic === 'denied' ? '<span class="warn">Microphone access denied.</span> Allow nam-zig in System Settings, Privacy &amp; Security, Microphone, then restart.' : '';
+  $('tuner').hidden = !s.tuner.on;
+  if (s.tuner.on) {
+    const t = s.tuner;
+    $('tuner_mono').hidden = t.mode === 'poly';
+    $('tuner_strings').hidden = t.mode !== 'poly';
+    if (t.mode === 'mono') {
+      $('tuner_note').textContent = t.note; $('tuner_cents').textContent = (t.cents >= 0 ? '+' : '') + t.cents.toFixed(1) + ' cents'; $('tuner_hz').textContent = t.hz.toFixed(2) + ' Hz';
+      $('tuner_needle').style.left = (50 + Math.max(-50, Math.min(50, t.cents))) + '%';
+    } else if (t.mode === 'listening') {
+      $('tuner_note').textContent = '--'; $('tuner_cents').textContent = 'pluck a string'; $('tuner_hz').textContent = ''; $('tuner_needle').style.left = '50%';
+    } else {
+      const names = ['E', 'A', 'D', 'G', 'B', 'e'];
+      $('tuner_strings').innerHTML = t.strings.map((st, i) => '<div><b class="' + (st.active && Math.abs(st.cents) < 5 ? 'in' : '') + '">' + names[i] + '</b>' + (st.active ? (st.cents >= 0 ? '+' : '') + st.cents.toFixed(0) : '-') + '</div>').join('');
+    }
+  }
+}
+function fillSelect(sel, items, current) {
+  const sig = items.map(d => d.name).join('') + '|' + current;
+  if (sel.dataset.sig === sig) return;
+  sel.dataset.sig = sig;
+  sel.innerHTML = '<option value="-1">System default</option>' + items.map((d, i) => '<option value="' + i + '">' + d.name.replace(/</g, '&lt;') + (d.default ? ' (default)' : '') + '</option>').join('');
+  sel.value = current === null || current === undefined ? '-1' : String(current);
+}
+function poll() { if (stopped) return; fetch('/api/state').then(r => r.json()).then(apply).catch(() => { $('status').textContent = 'connection lost'; }); }
+setInterval(poll, 100);
+poll();
+</script>
+</body>
+</html>

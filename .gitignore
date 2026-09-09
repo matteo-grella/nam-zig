@@ -5,3 +5,4 @@ zig-pkg/
 /nam-profiles/
 /models/
 .DS_Store
+dist/

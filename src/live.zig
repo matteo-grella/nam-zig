@@ -316,6 +316,10 @@ pub fn audioCallback(user: ?*anyopaque, output: ?[*]f32, input: ?[*]const f32, f
         }
     }
 
+    if (shared.chains.len == 0) {
+        @memset(out, 0);
+        return;
+    }
     const index = shared.current.load(.acquire);
     // Snapshot bypass once so a mid-block toggle can't split this block across
     // states (model on one path, cab/gate/gain on the other).
@@ -673,174 +677,50 @@ fn windowStats(samples: []const f32, sample_rate: u32) WindowStats {
     };
 }
 
-/// Runs the live loop until 'q'. `profiles` must be preloaded engines
-/// already reset(period, prewarm=true).
+/// Runs the terminal live loop until 'q'. `shared.chains` must be
+/// preloaded engines already reset(period, prewarm=true).
 pub fn run(io: std.Io, allocator: std.mem.Allocator, shared: *Shared, audio: *audio_mod.Audio, options: Options) !void {
     var terminal = try ui.RawTerminal.enable();
     defer terminal.restore();
 
-    // Enumerated once so 'i'/'o' can cycle devices at runtime.
-    var capture_storage: [audio_mod.max_devices]audio_mod.DeviceInfo = undefined;
-    var playback_storage: [audio_mod.max_devices]audio_mod.DeviceInfo = undefined;
-    const capture_devices = try audio.listDevices(.capture, &capture_storage);
-    const playback_devices = try audio.listDevices(.playback, &playback_storage);
-
-    var capture_index = options.capture;
-    var playback_index = options.playback;
-    // Explicit --playback (and later manual 'o' cycling) wins over the
-    // same-device suggestion; defaults get upgraded automatically.
-    var playback_user_set = options.playback != null;
-    var suggested_playback: ?usize = null;
-    if (options.auto_input) {
-        if (try autoDetectInput(io, allocator, audio, capture_devices, playback_devices, options)) |found| {
-            capture_index = found.capture;
-            applyTwin(io, found.playback_twin, playback_user_set, playback_devices, &playback_index, &suggested_playback);
-        }
-    }
-    // Tuner analysis thread + tap. Created (and shared.tap set) BEFORE the
-    // stream starts so the callback never races a plain-field write, and the
-    // deferred destroy is registered before defer audio.stop, so LIFO order
-    // stops the callbacks first and only then joins/frees the tap. Failure
-    // to spawn degrades to no-tuner, never a failed session.
-    const tun: ?*tuner_mod.Tuner = tuner_mod.Tuner.create(allocator, io, options.sample_rate, options.a4, options.tuner) catch |err| blk: {
-        ui.plainLine(io, "tuner: unavailable ({s})", .{@errorName(err)});
-        break :blk null;
-    };
-    defer if (tun) |t| t.destroy(allocator);
-    if (tun) |t| shared.tap = &t.tap;
-
-    try audio.start(capture_index, playback_index, options.sample_rate, options.period, audioCallback, shared);
-    defer audio.stop();
+    const session = try Session.create(io, allocator, shared, audio, options);
+    defer session.destroy();
 
     // The pinned status block reserves the bottom rows now, so every log line
     // below (device announce, MIDI, hot-plug) scrolls above it. When stdout is
     // not a tty the block stays inactive and run() falls back to one rewritten
     // status line. deinit() (resets the scroll region, shows the cursor) runs
-    // before audio.stop() and the terminal restore via defer LIFO.
+    // before the session teardown and the terminal restore via defer LIFO.
     var dash = ui.Dashboard.init(io);
     defer dash.deinit();
-    announceDevices(io, audio, options);
+    session.announce();
     if (!dash.active) printKeys(io); // active: keys live in the pinned block
 
-    // MIDI control is best-effort: no backend / no server / bad source
-    // index degrades to keyboard-only with a note, never a failed start.
-    var midi_stream = midi_mod.Stream{};
-    var midi: ?midi_mod.Midi = null;
-    defer if (midi) |*m| m.deinit();
-    var midi_signature: i64 = midi_reconnect_pending;
-    if (options.midi) {
-        if (midi_mod.Midi.init()) |m| {
-            midi = m;
-            // Signature BEFORE start: a source arriving inside the start
-            // window then reads as a change on the first rescan tick (one
-            // redundant reconnect) instead of being baked unconnected into
-            // the baseline forever.
-            const signature = midi.?.sourcesSignature();
-            const connected = midi.?.start(options.midi_source, &midi_stream) catch |err| blk: {
-                ui.plainLine(io, "midi: could not open input ({s}) — keyboard control only", .{@errorName(err)});
-                midi.?.deinit();
-                midi = null;
-                break :blk 0;
-            };
-            if (midi != null) {
-                midi_signature = signature;
-                announceMidi(io, &midi.?, connected, options);
-            }
-        } else |_| {
-            // Non-macOS build or unreachable MIDI server: silently keyboard-only.
-        }
-    }
-
     var running = true;
-    var silent_loops: usize = 0;
-    var midi_rescan_loops: usize = 0;
-    var midi_label_buf: [24]u8 = undefined;
-    var midi_label: []const u8 = "";
-    var midi_label_age: usize = 0;
-    var gate_db: f32 = options.gate_db orelse -65.0;
-    shared.gate.prepare(@floatFromInt(options.sample_rate));
-    shared.setGateThresholdDb(gate_db);
-    if (options.gate_db != null) shared.gate_on.store(true, .monotonic);
-    // Decaying peak-hold meter state (render thread only): rises instantly to
-    // the window peak, falls ~0.8 dB/tick (~24 dB/s) so the bar reads like a
-    // hardware meter instead of strobing.
-    var in_disp_db: f32 = -140;
-    var out_disp_db: f32 = -140;
-    const meter_decay_db: f32 = 0.8;
-    // Tuner display state (render thread only): the last valid reading is
-    // held ~0.5 s across attack transients so the needle doesn't flicker.
-    var tuner_note_buf: [8]u8 = undefined;
-    var tuner_held = ui.TunerView{};
-    var tuner_held_age: usize = 1000;
     while (running) {
         while (terminal.poll()) |key| {
             switch (key) {
                 'q', 3, 4 => running = false, // q / ^C / ^D (ISIG is off)
-                ' ' => _ = shared.bypass.store(!shared.bypass.load(.monotonic), .monotonic),
-                '[' => switchProfile(shared, -1),
-                ']' => switchProfile(shared, 1),
-                '1'...'9' => {
-                    const slot: usize = key - '1';
-                    if (slot < shared.chains.len) shared.current.store(slot, .release);
-                },
-                '+', '=' => adjustGain(shared, 1.0),
-                '-' => adjustGain(shared, -1.0),
-                ',' => adjustInputGain(shared, -1.0),
-                '.' => adjustInputGain(shared, 1.0),
-                'n' => _ = shared.normalize.store(!shared.normalize.load(.monotonic), .monotonic),
-                'g' => _ = shared.gate_on.store(!shared.gate_on.load(.monotonic), .monotonic),
-                't' => if (tun) |t| t.setEnabled(!t.enabled()),
-                'm' => _ = shared.mute.store(!shared.mute.load(.monotonic), .monotonic),
-                '<' => {
-                    gate_db = @max(gate_db - 5.0, gate_min_db);
-                    shared.setGateThresholdDb(gate_db);
-                },
-                '>' => {
-                    gate_db = @min(gate_db + 5.0, gate_max_db);
-                    shared.setGateThresholdDb(gate_db);
-                },
-                'c' => {
-                    // Clear both latched warnings (clip + oversize); neither has
-                    // any other reset path.
-                    shared.clipped.store(false, .monotonic);
-                    shared.oversize_blocks.store(0, .monotonic);
-                },
-                '?', 'h' => {
-                    printKeys(io);
-                    if (midi) |*m| announceMidi(io, m, null, options);
-                },
-                'i' => {
-                    if (capture_devices.len > 0) {
-                        capture_index = if (capture_index) |current| (current + 1) % capture_devices.len else 0;
-                        switchDevices(io, audio, shared, options, &capture_index, &playback_index);
-                        silent_loops = 0;
-                    }
-                },
-                'o' => {
-                    if (playback_devices.len > 0) {
-                        playback_index = if (playback_index) |current| (current + 1) % playback_devices.len else 0;
-                        playback_user_set = true;
-                        suggested_playback = null;
-                        switchDevices(io, audio, shared, options, &capture_index, &playback_index);
-                        silent_loops = 0;
-                    }
-                },
-                'a' => {
-                    audio.stop();
-                    if (autoDetectInput(io, allocator, audio, capture_devices, playback_devices, options) catch null) |found| {
-                        capture_index = found.capture;
-                        applyTwin(io, found.playback_twin, playback_user_set, playback_devices, &playback_index, &suggested_playback);
-                    }
-                    switchDevices(io, audio, shared, options, &capture_index, &playback_index);
-                    silent_loops = 0;
-                },
-                'y' => {
-                    if (suggested_playback) |twin| {
-                        playback_index = twin;
-                        suggested_playback = null;
-                        switchDevices(io, audio, shared, options, &capture_index, &playback_index);
-                    }
-                },
+                ' ' => session.toggleBypass(),
+                '[' => session.switchProfile(-1),
+                ']' => session.switchProfile(1),
+                '1'...'9' => session.selectChain(key - '1'),
+                '+', '=' => session.adjustGain(1.0),
+                '-' => session.adjustGain(-1.0),
+                ',' => session.adjustInputGain(-1.0),
+                '.' => session.adjustInputGain(1.0),
+                'n' => session.toggleNormalize(),
+                'g' => session.toggleGate(),
+                't' => session.toggleTuner(),
+                'm' => session.toggleMute(),
+                '<' => session.adjustGateDb(-5.0),
+                '>' => session.adjustGateDb(5.0),
+                'c' => session.clearWarnings(),
+                '?', 'h' => session.help(),
+                'i' => session.cycleCapture(),
+                'o' => session.cyclePlayback(),
+                'a' => session.autoInput(),
+                'y' => session.acceptSuggestion(),
                 else => {},
             }
         }
@@ -853,13 +733,372 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, shared: *Shared, audio: *au
             running = false;
         }
 
-        while (midi_stream.queue.pop()) |msg| {
-            if (applyMidi(shared, &gate_db, options, msg, &midi_label_buf)) |label| {
-                midi_label = label;
-                midi_label_age = 0;
+        const view = session.tick();
+        if (dash.active) dash.render(view) else ui.statusLineView(io, view);
+
+        std.Io.sleep(io, .{ .nanoseconds = 33 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    ui.plainLine(io, "", .{});
+}
+
+/// The end-to-end latency estimate, from the device's real CoreAudio
+/// latencies (device latency + safety offset + device buffer per side) plus
+/// the period and miniaudio's duplex ring pre-seek (2x the INTERNAL capture
+/// period, which can exceed the requested one).
+pub const LatencyInfo = struct {
+    rate: f64,
+    capture_dev_ms: f64,
+    playback_dev_ms: f64,
+    duplex_ms: f64,
+    total_ms: f64,
+    negotiated: u32,
+    capture_native: u32,
+    playback_native: u32,
+};
+
+pub fn latencyInfo(audio: *audio_mod.Audio, options: Options) LatencyInfo {
+    const rate: f64 = @floatFromInt(@max(audio.actualSampleRate(), 1));
+    const capture_dev: f64 = @floatFromInt(audio.deviceLatencyFrames(.capture));
+    const playback_dev: f64 = @floatFromInt(audio.deviceLatencyFrames(.playback));
+    const internal_capture: f64 = @floatFromInt(@max(audio.internalPeriodFrames(.capture), options.period));
+    const period: f64 = @floatFromInt(options.period);
+    const duplex_slack = 2.0 * internal_capture;
+    return .{
+        .rate = rate,
+        .capture_dev_ms = capture_dev / rate * 1000.0,
+        .playback_dev_ms = playback_dev / rate * 1000.0,
+        .duplex_ms = (period + duplex_slack) / rate * 1000.0,
+        .total_ms = (capture_dev + playback_dev + period + duplex_slack) / rate * 1000.0,
+        .negotiated = audio.internalPeriodFrames(.capture),
+        .capture_native = audio.internalSampleRate(.capture),
+        .playback_native = audio.internalSampleRate(.playback),
+    };
+}
+
+/// One live session: the devices, the tuner, MIDI, the meters, and every
+/// control, independent of how it is driven (the terminal loop above, the
+/// window's HTTP layer in web.zig). Heap-allocated: the MIDI stream and the
+/// label buffers are handed out by address.
+pub const Session = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    shared: *Shared,
+    audio: *audio_mod.Audio,
+    options: Options,
+    capture_storage: [audio_mod.max_devices]audio_mod.DeviceInfo = undefined,
+    playback_storage: [audio_mod.max_devices]audio_mod.DeviceInfo = undefined,
+    capture_devices: []audio_mod.DeviceInfo = &.{},
+    playback_devices: []audio_mod.DeviceInfo = &.{},
+    capture_index: ?usize = null,
+    playback_index: ?usize = null,
+    /// Explicit --playback (and later manual cycling) wins over the
+    /// same-device suggestion; defaults get upgraded automatically.
+    playback_user_set: bool = false,
+    suggested_playback: ?usize = null,
+    tuner: ?*tuner_mod.Tuner = null,
+    midi: ?midi_mod.Midi = null,
+    midi_stream: midi_mod.Stream = .{},
+    midi_signature: i64 = midi_reconnect_pending,
+    gate_db: f32 = -65.0,
+    audio_running: bool = false,
+    silent_loops: usize = 0,
+    midi_rescan_loops: usize = 0,
+    midi_label_buf: [24]u8 = undefined,
+    midi_label_len: usize = 0,
+    midi_label_age: usize = 0,
+    /// Decaying peak-hold meter state: rises instantly to the window peak,
+    /// falls ~0.8 dB/tick (~24 dB/s) so the bar reads like a hardware meter.
+    in_disp_db: f32 = -140,
+    out_disp_db: f32 = -140,
+    /// Tuner display state: the last valid reading is held ~0.5 s across
+    /// attack transients so the needle doesn't flicker.
+    tuner_note_buf: [8]u8 = undefined,
+    tuner_held: ui.TunerView = .{},
+    tuner_held_age: usize = 1000,
+    /// The last status message (device switch outcome, suggestions).
+    note_buf: [256]u8 = undefined,
+    note_len: usize = 0,
+
+    const meter_decay_db: f32 = 0.8;
+
+    /// Enumerates devices, runs the input probe when asked, creates the
+    /// tuner, and starts the stream (when there are chains to play).
+    pub fn create(io: std.Io, allocator: std.mem.Allocator, shared: *Shared, audio: *audio_mod.Audio, options: Options) !*Session {
+        const self = try allocator.create(Session);
+        errdefer allocator.destroy(self);
+        self.* = .{ .io = io, .allocator = allocator, .shared = shared, .audio = audio, .options = options };
+        self.capture_devices = try audio.listDevices(.capture, &self.capture_storage);
+        self.playback_devices = try audio.listDevices(.playback, &self.playback_storage);
+        self.capture_index = options.capture;
+        self.playback_index = options.playback;
+        self.playback_user_set = options.playback != null;
+        if (options.auto_input) {
+            if (try autoDetectInput(io, allocator, audio, self.capture_devices, self.playback_devices, options)) |found| {
+                self.capture_index = found.capture;
+                self.applyTwin(found.playback_twin);
             }
         }
-        midi_label_age += 1;
+        // Tuner analysis thread + tap, created (and shared.tap set) BEFORE the
+        // stream starts so the callback never races a plain-field write.
+        // Failure to spawn degrades to no-tuner, never a failed session.
+        self.tuner = tuner_mod.Tuner.create(allocator, io, options.sample_rate, options.a4, options.tuner) catch |err| blk: {
+            ui.plainLine(io, "tuner: unavailable ({s})", .{@errorName(err)});
+            break :blk null;
+        };
+        errdefer if (self.tuner) |t| t.destroy(allocator);
+        if (self.tuner) |t| shared.tap = &t.tap;
+
+        self.gate_db = options.gate_db orelse -65.0;
+        shared.gate.prepare(@floatFromInt(options.sample_rate));
+        shared.setGateThresholdDb(self.gate_db);
+        if (options.gate_db != null) shared.gate_on.store(true, .monotonic);
+
+        if (shared.chains.len > 0) try self.startAudio();
+        errdefer self.stopAudio();
+
+        // MIDI control is best-effort: no backend / no server / bad source
+        // index degrades to keyboard-only with a note, never a failed start.
+        if (options.midi) {
+            if (midi_mod.Midi.init()) |m| {
+                self.midi = m;
+                // Signature BEFORE start: a source arriving inside the start
+                // window then reads as a change on the first rescan tick (one
+                // redundant reconnect) instead of being baked unconnected into
+                // the baseline forever.
+                const signature = self.midi.?.sourcesSignature();
+                if (self.midi.?.start(options.midi_source, &self.midi_stream)) |_| {
+                    self.midi_signature = signature;
+                } else |err| {
+                    ui.plainLine(io, "midi: could not open input ({s}) — keyboard control only", .{@errorName(err)});
+                    self.midi.?.deinit();
+                    self.midi = null;
+                }
+            } else |_| {
+                // Non-macOS build or unreachable MIDI server: silently keyboard-only.
+            }
+        }
+        return self;
+    }
+
+    /// Stops the stream first (the callbacks), then joins the tuner and
+    /// releases MIDI.
+    pub fn destroy(self: *Session) void {
+        self.stopAudio();
+        if (self.midi) |*m| m.deinit();
+        if (self.tuner) |t| t.destroy(self.allocator);
+        self.allocator.destroy(self);
+    }
+
+    pub fn startAudio(self: *Session) !void {
+        if (self.audio_running) return;
+        try self.audio.start(self.capture_index, self.playback_index, self.options.sample_rate, self.options.period, audioCallback, self.shared);
+        self.audio_running = true;
+    }
+
+    pub fn stopAudio(self: *Session) void {
+        if (!self.audio_running) return;
+        self.audio.stop();
+        self.audio_running = false;
+    }
+
+    /// Prints the running device pair, the latency estimate, and the MIDI
+    /// sources (the terminal's session header).
+    pub fn announce(self: *Session) void {
+        if (self.audio_running) announceDevices(self.io, self.audio, self.options);
+        if (self.midi) |*m| announceMidi(self.io, m, self.midiConnectedCount(), self.options);
+    }
+
+    fn midiConnectedCount(self: *Session) ?usize {
+        const m = &(self.midi orelse return null);
+        var storage: [midi_mod.max_sources]midi_mod.SourceInfo = undefined;
+        return m.listSources(&storage).len;
+    }
+
+    /// Replaces the chain set while the stream is stopped; `chains` must
+    /// outlive the session's use of it (the caller owns the ChainSet).
+    pub fn swapChains(self: *Session, chains: []Chain) !void {
+        self.stopAudio();
+        self.shared.chains = chains;
+        self.shared.current.store(0, .release);
+        if (chains.len > 0) try self.startAudio();
+    }
+
+    pub fn latency(self: *Session) LatencyInfo {
+        return latencyInfo(self.audio, self.options);
+    }
+
+    pub fn note(self: *const Session) []const u8 {
+        return self.note_buf[0..self.note_len];
+    }
+
+    fn setNote(self: *Session, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.bufPrint(&self.note_buf, fmt, args) catch &self.note_buf;
+        self.note_len = text.len;
+        ui.plainLine(self.io, fmt, args);
+    }
+
+    pub fn midiLabel(self: *const Session) []const u8 {
+        return if (self.midi_label_len > 0 and self.midi_label_age < 45) self.midi_label_buf[0..self.midi_label_len] else "";
+    }
+
+    // ---- controls ----
+
+    pub fn toggleBypass(self: *Session) void {
+        self.setBypass(!self.shared.bypass.load(.monotonic));
+    }
+    pub fn setBypass(self: *Session, on: bool) void {
+        self.shared.bypass.store(on, .monotonic);
+    }
+    pub fn toggleMute(self: *Session) void {
+        self.setMute(!self.shared.mute.load(.monotonic));
+    }
+    pub fn setMute(self: *Session, on: bool) void {
+        self.shared.mute.store(on, .monotonic);
+    }
+    pub fn toggleNormalize(self: *Session) void {
+        self.setNormalize(!self.shared.normalize.load(.monotonic));
+    }
+    pub fn setNormalize(self: *Session, on: bool) void {
+        self.shared.normalize.store(on, .monotonic);
+    }
+    pub fn toggleGate(self: *Session) void {
+        self.setGate(!self.shared.gate_on.load(.monotonic));
+    }
+    pub fn setGate(self: *Session, on: bool) void {
+        self.shared.gate_on.store(on, .monotonic);
+    }
+    pub fn toggleTuner(self: *Session) void {
+        if (self.tuner) |t| t.setEnabled(!t.enabled());
+    }
+    pub fn setTuner(self: *Session, on: bool) void {
+        if (self.tuner) |t| t.setEnabled(on);
+    }
+    pub fn switchProfile(self: *Session, direction: i64) void {
+        switchProfileShared(self.shared, direction);
+    }
+    pub fn selectChain(self: *Session, slot: usize) void {
+        if (slot < self.shared.chains.len) self.shared.current.store(slot, .release);
+    }
+    pub fn adjustGain(self: *Session, delta_db: f32) void {
+        adjustGainShared(self.shared, delta_db);
+    }
+    pub fn setGainDb(self: *Session, db: f32) void {
+        self.shared.setGain(dbToLinear(std.math.clamp(db, out_gain_min_db, out_gain_max_db)));
+    }
+    pub fn adjustInputGain(self: *Session, delta_db: f32) void {
+        adjustInputGainShared(self.shared, delta_db);
+    }
+    pub fn setInputGainDb(self: *Session, db: f32) void {
+        self.shared.setInputGain(dbToLinear(std.math.clamp(db, in_gain_min_db, in_gain_max_db)));
+    }
+    pub fn adjustGateDb(self: *Session, delta_db: f32) void {
+        self.setGateDb(self.gate_db + delta_db);
+    }
+    pub fn setGateDb(self: *Session, db: f32) void {
+        self.gate_db = std.math.clamp(db, gate_min_db, gate_max_db);
+        self.shared.setGateThresholdDb(self.gate_db);
+    }
+    /// Clears both latched warnings (clip + oversize); neither has any
+    /// other reset path.
+    pub fn clearWarnings(self: *Session) void {
+        self.shared.clipped.store(false, .monotonic);
+        self.shared.oversize_blocks.store(0, .monotonic);
+    }
+    pub fn help(self: *Session) void {
+        printKeys(self.io);
+        if (self.midi) |*m| announceMidi(self.io, m, null, self.options);
+    }
+    pub fn cycleCapture(self: *Session) void {
+        if (self.capture_devices.len == 0) return;
+        self.capture_index = if (self.capture_index) |current| (current + 1) % self.capture_devices.len else 0;
+        self.restartDevices();
+    }
+    pub fn cyclePlayback(self: *Session) void {
+        if (self.playback_devices.len == 0) return;
+        self.playback_index = if (self.playback_index) |current| (current + 1) % self.playback_devices.len else 0;
+        self.playback_user_set = true;
+        self.suggested_playback = null;
+        self.restartDevices();
+    }
+    /// Selects an enumeration index (null = the system default).
+    pub fn selectCapture(self: *Session, index: ?usize) void {
+        if (index) |i| if (i >= self.capture_devices.len) return;
+        self.capture_index = index;
+        self.restartDevices();
+    }
+    pub fn selectPlayback(self: *Session, index: ?usize) void {
+        if (index) |i| if (i >= self.playback_devices.len) return;
+        self.playback_index = index;
+        self.playback_user_set = index != null;
+        self.suggested_playback = null;
+        self.restartDevices();
+    }
+    /// Probes every capture device (the stream is stopped meanwhile) and
+    /// adopts the cleanest signal.
+    pub fn autoInput(self: *Session) void {
+        self.stopAudio();
+        if (autoDetectInput(self.io, self.allocator, self.audio, self.capture_devices, self.playback_devices, self.options) catch null) |found| {
+            self.capture_index = found.capture;
+            self.applyTwin(found.playback_twin);
+            self.setNote("input: {s}", .{self.capture_devices[found.capture].nameSlice()});
+        } else {
+            self.setNote("no device carried signal; keeping the current input", .{});
+        }
+        self.restartDevices();
+    }
+    pub fn acceptSuggestion(self: *Session) void {
+        const twin = self.suggested_playback orelse return;
+        self.playback_index = twin;
+        self.suggested_playback = null;
+        self.restartDevices();
+    }
+
+    /// Applies (or suggests) using the detected input's playback twin as the
+    /// output: auto-applied when the user never chose an output, suggested
+    /// (press 'y' / the button) when they did.
+    fn applyTwin(self: *Session, twin: ?usize) void {
+        const twin_index = twin orelse return;
+        if (self.playback_index) |current| {
+            if (current == twin_index) return; // already there
+        }
+        if (!self.playback_user_set) {
+            self.playback_index = twin_index;
+            ui.plainLine(self.io, "output -> [{d}] {s} (same device as the input: one clock, no drift)", .{ twin_index, self.playback_devices[twin_index].nameSlice() });
+        } else {
+            self.suggested_playback = twin_index;
+            self.setNote("the detected input is a full interface: also use [{d}] {s} as the output? (press y)", .{ twin_index, self.playback_devices[twin_index].nameSlice() });
+        }
+    }
+
+    /// Restarts the duplex stream on the current device indices; on failure
+    /// walks back to the system defaults so the session keeps running.
+    fn restartDevices(self: *Session) void {
+        self.stopAudio();
+        self.silent_loops = 0;
+        if (self.shared.chains.len == 0) return;
+        self.startAudio() catch {
+            self.setNote("device open failed (capture {?d}, playback {?d}); falling back to system defaults", .{ self.capture_index, self.playback_index });
+            self.capture_index = null;
+            self.playback_index = null;
+            self.startAudio() catch {
+                self.setNote("could not reopen any device; pick another input/output", .{});
+                return;
+            };
+        };
+        announceDevices(self.io, self.audio, self.options);
+    }
+
+    /// One control-loop step (~30 Hz): drains MIDI, rescans hot-plugged
+    /// controllers, updates the meters and the tuner, and returns the view.
+    pub fn tick(self: *Session) ui.View {
+        const shared = self.shared;
+        while (self.midi_stream.queue.pop()) |msg| {
+            if (applyMidi(shared, &self.gate_db, self.options, msg, &self.midi_label_buf)) |label| {
+                self.midi_label_len = label.len;
+                self.midi_label_age = 0;
+            }
+        }
+        self.midi_label_age += 1;
 
         // Hot-plug: CoreMIDI notifications need a CFRunLoop we never spin,
         // so poll the source IDENTITY (count + unique IDs — a bare count
@@ -868,19 +1107,19 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, shared: *Shared, audio: *au
         // after launch). A failed start has already torn down the old port,
         // so it parks the stored signature on the sentinel: the next tick
         // retries even if the topology reverted meanwhile.
-        midi_rescan_loops += 1;
-        if (midi != null and options.midi_source == null and midi_rescan_loops >= 60) {
-            midi_rescan_loops = 0;
-            const signature = midi.?.sourcesSignature();
-            if (signature != midi_signature) {
-                if (midi.?.start(null, &midi_stream)) |connected| {
-                    midi_signature = signature;
-                    announceMidi(io, &midi.?, connected, options);
+        self.midi_rescan_loops += 1;
+        if (self.midi != null and self.options.midi_source == null and self.midi_rescan_loops >= 60) {
+            self.midi_rescan_loops = 0;
+            const signature = self.midi.?.sourcesSignature();
+            if (signature != self.midi_signature) {
+                if (self.midi.?.start(null, &self.midi_stream)) |connected| {
+                    self.midi_signature = signature;
+                    announceMidi(self.io, &self.midi.?, connected, self.options);
                 } else |err| {
-                    if (midi_signature != midi_reconnect_pending) {
-                        ui.plainLine(io, "midi: reconnect failed ({s}) — retrying every 2 s", .{@errorName(err)});
+                    if (self.midi_signature != midi_reconnect_pending) {
+                        ui.plainLine(self.io, "midi: reconnect failed ({s}) — retrying every 2 s", .{@errorName(err)});
                     }
-                    midi_signature = midi_reconnect_pending;
+                    self.midi_signature = midi_reconnect_pending;
                 }
             }
         }
@@ -890,155 +1129,97 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, shared: *Shared, audio: *au
         // the display rises to it instantly and decays otherwise.
         const in_peak: f32 = @bitCast(shared.in_peak_bits.swap(0, .monotonic));
         const out_peak: f32 = @bitCast(shared.out_peak_bits.swap(0, .monotonic));
-        in_disp_db = @max(ui.dbfs(in_peak), in_disp_db - meter_decay_db);
-        out_disp_db = @max(ui.dbfs(out_peak), out_disp_db - meter_decay_db);
+        self.in_disp_db = @max(ui.dbfs(in_peak), self.in_disp_db - meter_decay_db);
+        self.out_disp_db = @max(ui.dbfs(out_peak), self.out_disp_db - meter_decay_db);
         const gain_db = 20.0 * std.math.log10(@max(shared.gain(), 1e-6));
         const in_gain_db = 20.0 * std.math.log10(@max(shared.inputGain(), 1e-6));
         // ~5 s of dead input = almost certainly the wrong capture device or
         // a denied mic permission; surface a hint instead of staying mute.
-        silent_loops = if (in_peak < 1e-6) silent_loops + 1 else 0;
+        self.silent_loops = if (in_peak < 1e-6 and self.audio_running) self.silent_loops + 1 else 0;
 
-        const tuner_on = if (tun) |t| t.enabled() else false;
+        const tuner_on = if (self.tuner) |t| t.enabled() else false;
         var tuner_view = ui.TunerView{};
-        if (tun) |t| {
-            // Follow the device's real rate (changes on 'i'/'o'/'a' switches).
-            const rate = audio.actualSampleRate();
+        if (self.tuner) |t| {
+            // Follow the device's real rate (changes on device switches).
+            const rate = self.audio.actualSampleRate();
             if (rate != 0) t.setRate(rate);
             if (tuner_on) {
                 const snap = t.snapshot();
                 if (snap.poly_count >= 3) {
                     tuner_view.mode = .poly;
-                    for (&tuner_view.strings, snap.strings) |*dst, s| {
-                        dst.* = .{ .active = s.active, .cents = @floatCast(s.cents) };
+                    for (&tuner_view.strings, snap.strings) |*dst, st| {
+                        dst.* = .{ .active = st.active, .cents = @floatCast(st.cents) };
                     }
-                    tuner_held = tuner_view;
-                    tuner_held_age = 0;
+                    self.tuner_held = tuner_view;
+                    self.tuner_held_age = 0;
                 } else if (snap.valid) {
                     tuner_view = .{
                         .mode = .mono,
-                        .note = tuner_mod.noteLabel(snap.midi, &tuner_note_buf),
+                        .note = tuner_mod.noteLabel(snap.midi, &self.tuner_note_buf),
                         .cents = snap.cents,
                         .hz = snap.hz,
                     };
-                    tuner_held = tuner_view;
-                    tuner_held_age = 0;
-                } else if (tuner_held_age < 15) {
-                    tuner_held_age += 1;
-                    tuner_view = tuner_held;
+                    self.tuner_held = tuner_view;
+                    self.tuner_held_age = 0;
+                } else if (self.tuner_held_age < 15) {
+                    self.tuner_held_age += 1;
+                    tuner_view = self.tuner_held;
                 }
             }
         }
 
-        const view = ui.View{
+        const has_chains = shared.chains.len > 0;
+        return .{
             .chain_index = index,
             .chain_count = shared.chains.len,
-            .chain_name = shared.chains[index].name,
-            .stage_count = shared.chains[index].stages.len,
-            .in_db = in_disp_db,
-            .out_db = out_disp_db,
+            .chain_name = if (has_chains) shared.chains[index].name else "",
+            .stage_count = if (has_chains) shared.chains[index].stages.len else 0,
+            .in_db = self.in_disp_db,
+            .out_db = self.out_disp_db,
             .in_trim_db = in_gain_db,
             .out_gain_db = gain_db,
             .bypass = shared.bypass.load(.monotonic),
             .muted = shared.mute.load(.monotonic),
             .normalize = shared.normalize.load(.monotonic),
             .gate_on = shared.gate_on.load(.monotonic),
-            .gate_db = gate_db,
+            .gate_db = self.gate_db,
             .clipped = shared.clipped.load(.monotonic),
             .oversize = shared.oversize_blocks.load(.monotonic) > 0,
-            .silent = silent_loops > 150,
-            // Transient echo of the last applied MIDI event (~1.5 s).
-            .midi_label = if (midi_label.len > 0 and midi_label_age < 45) midi_label else "",
+            .silent = self.silent_loops > 150,
+            .midi_label = self.midiLabel(),
             .tuner_on = tuner_on,
             .tuner = tuner_view,
         };
-        if (dash.active) dash.render(view) else ui.statusLineView(io, view);
-
-        std.Io.sleep(io, .{ .nanoseconds = 33 * std.time.ns_per_ms }, .awake) catch {};
     }
-    ui.plainLine(io, "", .{});
-}
-
-/// Applies (or suggests) using the detected input's playback twin as the
-/// output: auto-applied when the user never chose an output, suggested
-/// (press 'y') when they did.
-fn applyTwin(
-    io: std.Io,
-    twin: ?usize,
-    playback_user_set: bool,
-    playback_devices: []const audio_mod.DeviceInfo,
-    playback_index: *?usize,
-    suggested_playback: *?usize,
-) void {
-    const twin_index = twin orelse return;
-    if (playback_index.*) |current| {
-        if (current == twin_index) return; // already there
-    }
-    if (!playback_user_set) {
-        playback_index.* = twin_index;
-        ui.plainLine(io, "output -> [{d}] {s} (same device as the input: one clock, no drift)", .{ twin_index, playback_devices[twin_index].nameSlice() });
-    } else {
-        suggested_playback.* = twin_index;
-        ui.plainLine(io, "suggestion: the detected input is a full interface — press y to also use [{d}] {s} as the output (one clock, no drift)", .{ twin_index, playback_devices[twin_index].nameSlice() });
-    }
-}
+};
 
 fn announceDevices(io: std.Io, audio: *audio_mod.Audio, options: Options) void {
     var capture_name: [audio_mod.name_cap]u8 = undefined;
     var playback_name: [audio_mod.name_cap]u8 = undefined;
     audio.runningNames(&capture_name, &playback_name);
-    const rate: f64 = @floatFromInt(audio.actualSampleRate());
-
-    // Honest end-to-end estimate: real CoreAudio device latencies (device
-    // latency + safety offset + device buffer per side) + the period +
-    // miniaudio's duplex ring pre-seek (2x the INTERNAL capture period —
-    // which can exceed the requested one; report the real value).
-    const capture_dev: f64 = @floatFromInt(audio.deviceLatencyFrames(.capture));
-    const playback_dev: f64 = @floatFromInt(audio.deviceLatencyFrames(.playback));
-    const internal_capture: f64 = @floatFromInt(@max(audio.internalPeriodFrames(.capture), options.period));
-    const period: f64 = @floatFromInt(options.period);
-    const duplex_slack = 2.0 * internal_capture;
-    const total_ms = (capture_dev + playback_dev + period + duplex_slack) / rate * 1000.0;
+    const info = latencyInfo(audio, options);
     ui.plainLine(io, "live: {s} -> {s} @ {d:.0} Hz, period {d} frames", .{
-        std.mem.sliceTo(&capture_name, 0), std.mem.sliceTo(&playback_name, 0), rate, options.period,
+        std.mem.sliceTo(&capture_name, 0), std.mem.sliceTo(&playback_name, 0), info.rate, options.period,
     });
-    if (capture_dev > 0 or playback_dev > 0) {
+    if (info.capture_dev_ms > 0 or info.playback_dev_ms > 0) {
         ui.plainLine(io, "latency ~{d:.1} ms total: input device {d:.1} ms + duplex+period {d:.1} ms + output device {d:.1} ms", .{
-            total_ms, capture_dev / rate * 1000.0, (period + duplex_slack) / rate * 1000.0, playback_dev / rate * 1000.0,
+            info.total_ms, info.capture_dev_ms, info.duplex_ms, info.playback_dev_ms,
         });
     }
     // A driver that refuses small buffers dominates the latency; make it
     // visible instead of silently inflating the estimate.
-    const negotiated = audio.internalPeriodFrames(.capture);
-    if (negotiated > options.period * 2) {
+    if (info.negotiated > options.period * 2) {
         ui.plainLine(io, "warning: the input device negotiated {d}-frame buffers (asked {d}) — its driver imposes ~{d:.1} ms of duplex slack; lower its buffer size in the vendor panel if possible", .{
-            negotiated, options.period, 2.0 * @as(f64, @floatFromInt(negotiated)) / rate * 1000.0,
+            info.negotiated, options.period, 2.0 * @as(f64, @floatFromInt(info.negotiated)) / info.rate * 1000.0,
         });
     }
-
-    const capture_native = audio.internalSampleRate(.capture);
-    const playback_native = audio.internalSampleRate(.playback);
-    if (capture_native != 0 and capture_native != audio.actualSampleRate()) {
-        ui.plainLine(io, "warning: input device runs at {d} Hz natively — macOS/miniaudio is resampling (extra latency). Set it to {d} Hz in Audio MIDI Setup.", .{ capture_native, audio.actualSampleRate() });
+    const actual = audio.actualSampleRate();
+    if (info.capture_native != 0 and info.capture_native != actual) {
+        ui.plainLine(io, "warning: input device runs at {d} Hz natively — macOS/miniaudio is resampling (extra latency). Set it to {d} Hz in Audio MIDI Setup.", .{ info.capture_native, actual });
     }
-    if (playback_native != 0 and playback_native != audio.actualSampleRate()) {
-        ui.plainLine(io, "warning: output device runs at {d} Hz natively — macOS/miniaudio is resampling (extra latency). Set it to {d} Hz in Audio MIDI Setup.", .{ playback_native, audio.actualSampleRate() });
+    if (info.playback_native != 0 and info.playback_native != actual) {
+        ui.plainLine(io, "warning: output device runs at {d} Hz natively — macOS/miniaudio is resampling (extra latency). Set it to {d} Hz in Audio MIDI Setup.", .{ info.playback_native, actual });
     }
-}
-
-/// Restarts the duplex stream on new device indices; on failure walks back
-/// to the system defaults so the session keeps running.
-fn switchDevices(io: std.Io, audio: *audio_mod.Audio, shared: *Shared, options: Options, capture_index: *?usize, playback_index: *?usize) void {
-    audio.stop();
-    audio.start(capture_index.*, playback_index.*, options.sample_rate, options.period, audioCallback, shared) catch {
-        ui.plainLine(io, "device open failed (capture {?d}, playback {?d}); falling back to system defaults", .{ capture_index.*, playback_index.* });
-        capture_index.* = null;
-        playback_index.* = null;
-        audio.start(null, null, options.sample_rate, options.period, audioCallback, shared) catch {
-            ui.plainLine(io, "could not reopen any device; quit and re-run with --capture/--playback from `devices`", .{});
-            return;
-        };
-    };
-    announceDevices(io, audio, options);
 }
 
 fn printKeys(io: std.Io) void {
@@ -1076,7 +1257,7 @@ fn announceMidi(io: std.Io, midi: *midi_mod.Midi, connected: ?usize, options: Op
     });
 }
 
-fn switchProfile(shared: *Shared, direction: i64) void {
+fn switchProfileShared(shared: *Shared, direction: i64) void {
     const count = shared.chains.len;
     if (count == 0) return;
     const current = shared.current.load(.monotonic);
@@ -1087,13 +1268,13 @@ fn switchProfile(shared: *Shared, direction: i64) void {
     shared.current.store(next, .release);
 }
 
-fn adjustGain(shared: *Shared, delta_db: f32) void {
+fn adjustGainShared(shared: *Shared, delta_db: f32) void {
     const current_db = 20.0 * std.math.log10(@max(shared.gain(), 1e-6));
     const next_db = std.math.clamp(current_db + delta_db, out_gain_min_db, out_gain_max_db);
     shared.setGain(std.math.pow(f32, 10.0, next_db / 20.0));
 }
 
-fn adjustInputGain(shared: *Shared, delta_db: f32) void {
+fn adjustInputGainShared(shared: *Shared, delta_db: f32) void {
     const current_db = 20.0 * std.math.log10(@max(shared.inputGain(), 1e-6));
     const next_db = std.math.clamp(current_db + delta_db, in_gain_min_db, in_gain_max_db);
     shared.setInputGain(std.math.pow(f32, 10.0, next_db / 20.0));

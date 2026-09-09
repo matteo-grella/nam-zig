@@ -187,6 +187,49 @@ int nam_audio_start_capture(
     return 0;
 }
 
+/* Playback-only stream (test tone, previews): the callback receives
+ * input == NULL and fills `output`. Same index/return contract as
+ * nam_audio_start. */
+int nam_audio_start_playback(
+    nam_audio* audio,
+    int playback_index,
+    unsigned int sample_rate,
+    unsigned int period_frames,
+    nam_audio_callback callback,
+    void* user) {
+    if (audio->device_ready) return -1;
+
+    ma_device_info* playback_infos;
+    ma_uint32 playback_count;
+    ma_device_info* capture_infos;
+    ma_uint32 capture_count;
+    if (ma_context_get_devices(&audio->context, &playback_infos, &playback_count, &capture_infos, &capture_count) != MA_SUCCESS) {
+        return -2;
+    }
+    if (playback_index >= (int)playback_count) return -3;
+
+    audio->callback = callback;
+    audio->user = user;
+
+    ma_device_config config = ma_device_config_init(ma_device_type_playback);
+    if (playback_index >= 0) config.playback.pDeviceID = &playback_infos[playback_index].id;
+    config.playback.format = ma_format_f32;
+    config.playback.channels = 1;
+    config.sampleRate = sample_rate;
+    config.periodSizeInFrames = period_frames;
+    config.dataCallback = nam_device_callback;
+    config.pUserData = audio;
+
+    if (ma_device_init(&audio->context, &config, &audio->device) != MA_SUCCESS) return -4;
+    audio->device_ready = 1;
+    if (ma_device_start(&audio->device) != MA_SUCCESS) {
+        ma_device_uninit(&audio->device);
+        audio->device_ready = 0;
+        return -5;
+    }
+    return 0;
+}
+
 void nam_audio_stop(nam_audio* audio) {
     if (!audio->device_ready) return;
     ma_device_uninit(&audio->device);
