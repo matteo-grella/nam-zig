@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+zig-pkg/
+/refs/
+/nam-profiles/
+/models/
+.DS_Store
