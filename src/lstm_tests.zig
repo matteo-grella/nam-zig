@@ -286,7 +286,7 @@ test "exported lstm .nam loads in the app engine and plays the tensor model's ou
     defer allocator.free(weights);
     const config = model.spec.engineConfig();
 
-    const path = "/tmp/nam-zig-lstm-export-test.nam";
+    const path = ".zig-cache/nam-zig-lstm-export-test.nam";
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
     try nam_export.exportLstmConfig(std.testing.io, allocator, path, &config, weights, .{ .unix_seconds = 1_700_000_000 });
 

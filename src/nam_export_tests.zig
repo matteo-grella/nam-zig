@@ -43,7 +43,7 @@ test "A2 training config export round-trips through the NAM loader" {
     const weights = try train.initWaveNetWeights(allocator, &config, 99);
     defer allocator.free(weights);
 
-    const path = "/tmp/nam-zig-a2-export-test.nam";
+    const path = ".zig-cache/nam-zig-a2-export-test.nam";
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
     try exportWaveNetConfig(std.testing.io, allocator, path, &config, weights, .{
         .unix_seconds = 0,
@@ -85,7 +85,7 @@ test "packed WaveNet export writes a SlimmableContainer loadable at highest qual
         else => return error.TestExpectedPackedSnapshot,
     };
 
-    const path = "/tmp/nam-zig-packed-export-test.nam";
+    const path = ".zig-cache/nam-zig-packed-export-test.nam";
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
     try exportSlimmableContainer(std.testing.io, allocator, path, packed_snapshot.submodels, .{
         .unix_seconds = 0,
