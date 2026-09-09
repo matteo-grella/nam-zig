@@ -25,7 +25,8 @@ folder described below.
 ## First run
 
 1. **Open the app.** A window appears and a folder named `nam-zig` is created inside
-   your `Music` folder, with a `profiles` subfolder. Press **Open folder** to see it.
+   your music folder (`Music`, or its localized name on Linux), with a `profiles`
+   subfolder. Press **Open folder** to see it.
 2. **Get a profile.** Download any `.nam` file: [Tone3000](https://www.tone3000.com)
    hosts thousands of free ones (they are almost all "standard WaveNet", which this player
    runs at full fidelity). A profile made with the official NAM trainer works too.
@@ -439,8 +440,11 @@ Module layout is described in the module doc comments of `src/*.zig`.
 
 ## The nam-zig folder
 
-Everything the app keeps is in one folder: `Music/nam-zig` in your home directory
-(`NAM_ZIG_HOME` overrides the location).
+Everything the app keeps is in one folder, `nam-zig` inside your music folder:
+`~/Music/nam-zig` on macOS, `%USERPROFILE%\Music\nam-zig` on Windows, and on Linux the
+xdg-user-dirs music folder (`XDG_MUSIC_DIR` in `~/.config/user-dirs.dirs`, so a localized
+`Musica` or `Musik` is honored; `~/Music` when unset). `NAM_ZIG_HOME` overrides the
+location.
 
 | Path | Content |
 | --- | --- |

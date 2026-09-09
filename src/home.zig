@@ -22,7 +22,7 @@ pub const Home = struct {
             try allocator.dupe(u8, explicit)
         else blk: {
             const base = env.get(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME") orelse return error.NoHomeDirectory;
-            break :blk try std.fs.path.join(allocator, &.{ base, "Music", "nam-zig" });
+            break :blk try std.fs.path.join(allocator, &.{ try musicDir(allocator, io, env, base), "nam-zig" });
         };
         return .{
             .allocator = allocator,
@@ -101,6 +101,69 @@ pub const Home = struct {
         return data.detectInputVersion(bytes) == .v3_0_0;
     }
 };
+
+/// The user's music folder: `Music` under the home directory on macOS and
+/// Windows (the on-disk name in every language); on other systems the
+/// xdg-user-dirs setting (`XDG_MUSIC_DIR`, else `MUSIC` in
+/// `user-dirs.dirs`, which desktops localize: `Musica`, `Musik`, ...),
+/// falling back to `Music`.
+fn musicDir(allocator: std.mem.Allocator, io: std.Io, env: *const Env, home: []const u8) ![]const u8 {
+    if (builtin.os.tag != .macos and builtin.os.tag != .windows) {
+        if (env.get("XDG_MUSIC_DIR")) |dir| {
+            if (dir.len > 0 and dir[0] == '/') return try allocator.dupe(u8, dir);
+        }
+        const config_dir = env.get("XDG_CONFIG_HOME") orelse try std.fs.path.join(allocator, &.{ home, ".config" });
+        const path = try std.fs.path.join(allocator, &.{ config_dir, "user-dirs.dirs" });
+        if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024))) |text| {
+            defer allocator.free(text);
+            if (try xdgUserDir(allocator, text, "XDG_MUSIC_DIR", home)) |dir| return dir;
+        } else |_| {}
+    }
+    return try std.fs.path.join(allocator, &.{ home, "Music" });
+}
+
+/// The value of `key` in an xdg-user-dirs file (`KEY="$HOME/Musica"` or
+/// `KEY="/absolute/path"`), with `$HOME` expanded to `home`; null when the
+/// key is absent or its value is not an absolute location.
+pub fn xdgUserDir(allocator: std.mem.Allocator, text: []const u8, key: []const u8, home: []const u8) !?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        const rest = line[key.len..];
+        if (rest.len == 0 or rest[0] != '=') continue;
+        var value = std.mem.trim(u8, rest[1..], " \t");
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
+        if (std.mem.eql(u8, value, "$HOME") or std.mem.eql(u8, value, "$HOME/")) return try allocator.dupe(u8, home);
+        if (std.mem.startsWith(u8, value, "$HOME/")) return try std.fs.path.join(allocator, &.{ home, value["$HOME/".len..] });
+        if (value.len > 0 and value[0] == '/') return try allocator.dupe(u8, value);
+        return null;
+    }
+    return null;
+}
+
+test "xdg user-dirs: localized music folder, absolute values, comments" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\# This file is written by xdg-user-dirs-update
+        \\XDG_DESKTOP_DIR="$HOME/Scrivania"
+        \\XDG_MUSIC_DIR="$HOME/Musica"
+        \\XDG_PICTURES_DIR="/mnt/photos"
+        \\XDG_VIDEOS_DIR="$HOME"
+    ;
+    const music = (try xdgUserDir(allocator, text, "XDG_MUSIC_DIR", "/home/mg")).?;
+    defer allocator.free(music);
+    try std.testing.expectEqualStrings("/home/mg/Musica", music);
+    const pictures = (try xdgUserDir(allocator, text, "XDG_PICTURES_DIR", "/home/mg")).?;
+    defer allocator.free(pictures);
+    try std.testing.expectEqualStrings("/mnt/photos", pictures);
+    const videos = (try xdgUserDir(allocator, text, "XDG_VIDEOS_DIR", "/home/mg")).?;
+    defer allocator.free(videos);
+    try std.testing.expectEqualStrings("/home/mg", videos);
+    try std.testing.expect((try xdgUserDir(allocator, text, "XDG_DOWNLOAD_DIR", "/home/mg")) == null);
+    try std.testing.expect((try xdgUserDir(allocator, "XDG_MUSIC_DIR=relative/path\n", "XDG_MUSIC_DIR", "/home/mg")) == null);
+}
 
 pub const capture_signal_url = "https://drive.google.com/uc?export=download&id=1Pgf8PdE0rKB1TD4TRPKbpNo1ByR3IOm9";
 pub const capture_signal_page = "https://drive.google.com/file/d/1Pgf8PdE0rKB1TD4TRPKbpNo1ByR3IOm9/view";
