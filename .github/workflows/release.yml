@@ -21,6 +21,7 @@ jobs:
             name: macos-x86_64
             target: x86_64-macos
             cpu: x86_64_v3
+            sysroot: "--sysroot $(xcrun --show-sdk-path)"
           - os: ubuntu-latest
             name: linux-x86_64
             target: x86_64-linux-gnu
@@ -42,12 +43,12 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }}
+          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} ${{ matrix.sysroot }}
       - name: Package (macOS app bundle)
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          zig build app -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }}
+          zig build app -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} ${{ matrix.sysroot }}
           mkdir -p dist
           cp README.md LICENSE THIRD-PARTY-NOTICES.md zig-out/
           (cd zig-out && zip -qry "../dist/nam-zig-${GITHUB_REF_NAME}-${{ matrix.name }}.zip" nam-zig.app bin/nam-zig README.md LICENSE THIRD-PARTY-NOTICES.md)

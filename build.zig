@@ -81,6 +81,13 @@ fn configureNative(step: *std.Build.Step.Compile) void {
     }
     const target = module.resolved_target.?.result;
     if (target.os.tag == .macos) {
+        // A non-native Apple target (`-Dtarget=x86_64-macos` on an arm64
+        // Mac) finds the frameworks through `--sysroot $(xcrun --show-sdk-path)`.
+        if (step.step.owner.sysroot) |sysroot| {
+            const b = step.step.owner;
+            module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }) });
+            module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
+        }
         module.addCSourceFile(.{
             .file = step.step.owner.path("src/window_shim.m"),
             .flags = &.{ "-fno-sanitize=undefined", "-fobjc-arc", "-O2" },
