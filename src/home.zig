@@ -142,7 +142,9 @@ pub fn xdgUserDir(allocator: std.mem.Allocator, text: []const u8, key: []const u
         var value = std.mem.trim(u8, rest[1..], " \t");
         if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
         if (std.mem.eql(u8, value, "$HOME") or std.mem.eql(u8, value, "$HOME/")) return try allocator.dupe(u8, home);
-        if (std.mem.startsWith(u8, value, "$HOME/")) return try std.fs.path.join(allocator, &.{ home, value["$HOME/".len..] });
+        // A POSIX path on every host: the file only exists on xdg systems,
+        // and the test runs on Windows too, where path.join would use `\`.
+        if (std.mem.startsWith(u8, value, "$HOME/")) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ std.mem.trimEnd(u8, home, "/"), value["$HOME/".len..] });
         if (value.len > 0 and value[0] == '/') return try allocator.dupe(u8, value);
         return null;
     }
