@@ -95,6 +95,12 @@ pub const Home = struct {
         return self.signal_path;
     }
 
+    /// The v3 capture signal is in the folder and byte-exact.
+    pub fn captureSignalReady(self: *const Home) bool {
+        if (!self.exists(self.signal_path)) return false;
+        return self.signalIsExact(self.signal_path) catch false;
+    }
+
     fn signalIsExact(self: *const Home, path: []const u8) !bool {
         const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(256 * 1024 * 1024)) catch return false;
         defer self.allocator.free(bytes);

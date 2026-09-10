@@ -42,8 +42,10 @@ folder described below.
    amp, which changes the tone), output gain, a noise gate with its threshold, loudness
    normalization across profiles, bypass, mute, and a chromatic tuner.
 
-Your device choice, profile, and knob positions are saved in `nam-zig/config.txt` and
-restored next time. `nam-zig doctor` (from a terminal) checks the folder, the microphone
+The terminal player's keys work in the window too (`space` bypass, `m` mute, `t` tuner,
+`[` `]` and `1`–`9` for profiles, `,`/`.` drive, `+`/`-` gain, and so on; press `?` for the
+list), alongside the mouse. Your device choice, profile, and knob positions are saved in
+`nam-zig/config.txt` and restored next time. `nam-zig doctor` (from a terminal) checks the folder, the microphone
 permission, the devices, and plays a test tone; `nam-zig open` opens the folder.
 
 If you hear nothing: on macOS a denied microphone permission yields silence with no error;
@@ -53,11 +55,34 @@ interface you capture with: one device means one sample clock.
 
 ## Capture your own amp
 
-`nam-zig profile` plays the standardized capture signal through your rig, records what
-comes back, trains a profile, and saves it into your `profiles` folder. The capture signal
-(`v3_0_0.wav`) is downloaded once into the `nam-zig` folder, checksum verified. See
-[Profiling an amp or pedal](#profiling-an-amp-or-pedal-profile--train) for the wiring and
-the command.
+Press **Capture your amp...** in the window. It walks you through it, no terminal needed:
+
+1. **Describe.** Name the profile, say what it is (an amp through a line out or load box,
+   an amp with its speaker, a pedal, ...) and its tone, pick the interface input and output,
+   and choose the training length: *Best quality* (100 rounds) or *Quick* (25 rounds), each
+   with the time it takes on your computer. The standardized capture signal (`v3_0_0.wav`,
+   27 MB) is downloaded once into the `nam-zig` folder, checksum verified.
+2. **Connect and set the level.** Wire the interface output into the amp (a reamp box is
+   recommended) and the amp's line out, load box, or a microphone back into the interface
+   input; unplug the guitar. The window plays the loudest passage of the test signal on a
+   loop and shows the level coming back: turn the interface's input gain until it reads
+   **Good** (green). The loop is the hottest material in the signal, so a level that is fine
+   here cannot clip during the recording. Never plug a speaker output into the interface.
+3. **Record.** Three minutes through the amp, with a progress bar and the return level.
+   Keep every knob still and stay quiet: gates, reverb, delay, or a moved knob fail the
+   consistency check afterwards (the window says so, and offers to train anyway). A
+   clipping return stops the recording right away, with the fix spelled out.
+4. **Train.** One line per round with the best match so far, in words (*Excellent*, *Good*,
+   *Fair*, *Weak*) and as the ESR figure, plus the time left. *Finish now* stops early and
+   keeps the best round; closing the app mid-training does the same.
+5. **Done.** The profile is in your list, selected. Plug the guitar back into the interface
+   and close the wizard: live playing resumes then (it is paused throughout, because the
+   rig is wired for reamping and the live output would feed the amp's input).
+
+Everything it makes lands in the `nam-zig` folder: the recording under `captures/`, the
+profile under `profiles/`. The same flow exists in the terminal as `nam-zig profile`; see
+[Profiling an amp or pedal](#profiling-an-amp-or-pedal-profile--train) for the wiring in
+detail and the command.
 
 ## Built on Fucina
 
@@ -176,7 +201,9 @@ click every couple of minutes (the two clocks drift apart).
 
 ### Profiling an amp or pedal (`profile` / `train`)
 
-Two cable runs at once: the capture signal goes **out** of the interface into your gear, and
+The window's **Capture your amp...** button does all of this step by step (see
+[Capture your own amp](#capture-your-own-amp)); what follows is the wiring in detail and
+the terminal equivalent. Two cable runs at once: the capture signal goes **out** of the interface into your gear, and
 the gear's output comes **back in**:
 
 ```
@@ -214,8 +241,11 @@ nam-zig profile --capture 2 --playback 2 --name "My Amp" --gear-type amp --tone-
 ```
 
 downloads the capture signal on first use (into the `nam-zig` folder), plays it through
-your rig, records the return under `captures/`, and trains; the profile lands in
-`profiles/` as `My-Amp.nam`, where the window lists it. `--signal`, `--reamp-out`, and
+your rig, records the return under `captures/` (a return that hits full scale stops the
+capture at once: the trainer would refuse it anyway), and trains; the profile lands in
+`profiles/` as `My-Amp.nam`, where the window lists it. Unlike the window, the terminal
+command has no level check: set the return level first (the `live` input meter, or a DAW),
+aiming for peaks around −6 dBFS on the loudest passages. `--signal`, `--reamp-out`, and
 `--out` override those paths. Alternatively
 record the reamp in your DAW and run the two-step version:
 `nam-zig train --input v3_0_0.wav --output reamp.wav --out my-amp.nam`. Any other
@@ -345,7 +375,7 @@ Captures with no `gear_type`, and pedal-only chains, are left alone.
 
 | Command | What it does |
 | --- | --- |
-| `gui [--port N] [--no-window] [--no-open] [--period N]` | The window over the profiles in your `nam-zig` folder (the default when launched from the desktop). |
+| `gui [--port N] [--no-window] [--no-open] [--period N]` | The window over the profiles in your `nam-zig` folder, with the step-by-step amp capture (the default when launched from the desktop). |
 | `doctor [--no-tone] [--download]` | Check the folder, the capture signal (`--download` fetches it), the microphone permission, devices, and play a test tone. |
 | `open` | Open the `nam-zig` folder in the file manager. |
 | `devices` | List capture/playback devices and MIDI sources with indices. |

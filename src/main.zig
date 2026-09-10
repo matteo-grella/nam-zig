@@ -25,6 +25,7 @@ const ui = @import("ui.zig");
 const profiles_mod = @import("profiles.zig");
 const home_mod = @import("home.zig");
 const gui_mod = @import("gui.zig");
+const profiler = @import("profiler.zig");
 const web = @import("web.zig");
 const discoverProfiles = profiles_mod.discoverProfiles;
 const stripProfileExt = profiles_mod.stripProfileExt;
@@ -40,7 +41,8 @@ const usage =
     \\
     \\play:
     \\  gui [--port N] [--no-window] [--no-open] [--period N]
-    \\      the window: profiles from the nam-zig folder, devices, knobs, meters, tuner
+    \\      the window: profiles from the nam-zig folder, devices, knobs, meters, tuner,
+    \\      and the step-by-step amp capture
     \\  live [<profile>...] [--ir cab.wav] [--chain rig.chain] [--capture N] [--playback N]
     \\       [--rate 48000] [--period 128] [--gain dB] [--input-gain dB] [--no-normalize]
     \\       [--gate dB] [--auto-input] [--midi N | --no-midi] [--midi-channel C] [--midi-map ...]
@@ -424,258 +426,15 @@ fn benchTrainStep(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writ
     }
     if (ny == 0) return error.InvalidArgument;
     const spec = try train_mod.TrainingSpec.parse(args[0]);
-    const rf = spec.receptiveField();
-    const nx = rf - 1 + ny;
-    const window = try allocator.alloc(f32, nx);
-    defer allocator.free(window);
-    wavenet_mod.fillSignal(window, 9);
-    const target = try allocator.alloc(f32, ny);
-    defer allocator.free(target);
-    for (target, window[nx - ny ..]) |*dst, v| dst.* = 0.5 * std.math.tanh(2.0 * v);
-
-    var ctx: fucina.ExecContext = undefined;
-    ctx.init(allocator);
-    defer ctx.deinit();
-    var model = try spec.initTrainable(allocator, &ctx, 5);
-    defer model.deinit();
-    var opt = try fucina.optim.Adam.init(allocator, .{ .lr = 0.001, .weight_decay = 0 });
-    defer opt.deinit();
-    try model.registerParams(&opt);
-    var best: f64 = std.math.inf(f64);
-    for (0..5) |iter| {
-        const start = nowNs(io);
-        {
-            const scope = ctx.openExecScope();
-            defer ctx.closeExecScope(scope);
-            var loss = try model.segmentLoss(&ctx, window, target);
-            try loss.backward(&ctx);
-        }
-        opt.zeroGrad();
-        const ns: f64 = @floatFromInt(nowNs(io) - start);
-        if (iter >= 2) best = @min(best, ns);
-    }
-    try stdout.print("train step {s}: nx {d} ny {d}: {d:.2} ms (loss + backward, best of 3)\n", .{ spec.name(), nx, ny, best / 1e6 });
-}
-
-const TrainSplits = struct {
-    version: data.InputVersion,
-    latency: i64,
-    calibration: ?data.LatencyCalibration,
-    checks_passed: bool,
-    train_x: []const f32,
-    train_y: []const f32,
-    val_x: []const f32,
-    val_y: []const f32,
-};
-
-const NormalizedOutputs = struct {
-    train_y: []f32,
-    val_y: []f32,
-    train_scale: f32,
-
-    const target_dbfs: f64 = -18.0;
-
-    fn deinit(self: *NormalizedOutputs, allocator: std.mem.Allocator) void {
-        allocator.free(self.train_y);
-        allocator.free(self.val_y);
-        self.* = undefined;
-    }
-
-    fn exportCompensation(self: *const NormalizedOutputs) f32 {
-        return 1.0 / self.train_scale;
-    }
-};
-
-fn normalizeJointOutput(allocator: std.mem.Allocator, train_y: []const f32, val_y: []const f32) !NormalizedOutputs {
-    var sum_sq: f64 = 0;
-    for (train_y) |v| sum_sq += @as(f64, v) * v;
-    if (train_y.len == 0) return error.EmptyTrainingData;
-    if (sum_sq == 0) return error.ZeroTrainingOutput;
-    const train_rms = @sqrt(sum_sq / @as(f64, @floatFromInt(train_y.len)));
-    const target_rms = std.math.pow(f64, 10.0, NormalizedOutputs.target_dbfs / 20.0);
-    const scale: f32 = @floatCast(target_rms / train_rms);
-    if (!std.math.isFinite(scale) or scale == 0) return error.InvalidOutputScale;
-
-    const train_scaled = try allocator.alloc(f32, train_y.len);
-    errdefer allocator.free(train_scaled);
-    const val_scaled = try allocator.alloc(f32, val_y.len);
-    errdefer allocator.free(val_scaled);
-    for (train_scaled, train_y) |*dst, v| dst.* = scale * v;
-    for (val_scaled, val_y) |*dst, v| dst.* = scale * v;
-    return .{ .train_y = train_scaled, .val_y = val_scaled, .train_scale = scale };
-}
-
-test "normalizeJointOutput scales train and validation from training RMS" {
-    const allocator = std.testing.allocator;
-    const train_y = [_]f32{ 0.25, -0.25, 0.5, -0.5 };
-    const val_y = [_]f32{ 0.125, -0.125 };
-    var normalized = try normalizeJointOutput(allocator, &train_y, &val_y);
-    defer normalized.deinit(allocator);
-
-    const train_rms = @sqrt((4.0 * 0.25 * 0.25 + 4.0 * 0.5 * 0.5) / 8.0);
-    const target_rms = std.math.pow(f64, 10.0, NormalizedOutputs.target_dbfs / 20.0);
-    const expected_scale: f32 = @floatCast(target_rms / train_rms);
-    try std.testing.expectApproxEqAbs(expected_scale, normalized.train_scale, 1e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25 * expected_scale), normalized.train_y[0], 1e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, -0.5 * expected_scale), normalized.train_y[3], 1e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.125 * expected_scale), normalized.val_y[0], 1e-7);
-    try std.testing.expectApproxEqAbs(1.0 / expected_scale, normalized.exportCompensation(), 1e-7);
-}
-
-test "normalizeJointOutput rejects empty or zero training output" {
-    const allocator = std.testing.allocator;
-    const val_y = [_]f32{0.125};
-    try std.testing.expectError(error.EmptyTrainingData, normalizeJointOutput(allocator, &.{}, &val_y));
-    const zero_train = [_]f32{ 0, 0, 0 };
-    try std.testing.expectError(error.ZeroTrainingOutput, normalizeJointOutput(allocator, &zero_train, &val_y));
-}
-
-fn checkV3InputPreSilence(x: []const f32) data.DataError!void {
-    try data.checkInputPreSilence(x, data.v3.train_start, data.standard_sample_rate);
-    try data.checkInputPreSilence(x, x.len - data.v3.t_validate, data.standard_sample_rate);
-}
-
-test "v3 input pre-silence is required before train and validation splits" {
-    const allocator = std.testing.allocator;
-    const n = data.v3.train_start + data.v3.t_validate + @as(usize, 48_000);
-    const x = try allocator.alloc(f32, n);
-    defer allocator.free(x);
-
-    @memset(x, 0);
-    try checkV3InputPreSilence(x);
-
-    x[data.v3.train_start - 1] = 0.125;
-    try std.testing.expectError(data.DataError.InputPreSilenceMissing, checkV3InputPreSilence(x));
-
-    @memset(x, 0);
-    const validation_start = x.len - data.v3.t_validate;
-    x[validation_start - 1] = 0.125;
-    try std.testing.expectError(data.DataError.InputPreSilenceMissing, checkV3InputPreSilence(x));
-}
-
-/// Resolves capture version, latency, checks, and the train/validation
-/// splits for an (input, reamp) pair, matching the upstream
-/// neural-amp-modeler trainer: latency (delay) calibration, the v3 data
-/// checks, and the per-input-version train/validation split points.
-fn resolveSplits(
-    stdout: *std.Io.Writer,
-    input_bytes: []const u8,
-    x: []const f32,
-    y: []const f32,
-    manual_latency: ?i64,
-    ignore_checks: bool,
-) !TrainSplits {
-    const version = data.detectInputVersion(input_bytes);
-    switch (version) {
-        .v1_0_0, .v1_1_1, .v2_0_0, .v4_0_0 => {
-            try stdout.writeAll("error: v1/v2/v4 capture files are deprecated upstream; re-record with the v3 input file\n");
-            return error.DeprecatedInputVersion;
-        },
-        else => {},
-    }
-
-    var calibration: ?data.LatencyCalibration = null;
-    var latency: i64 = manual_latency orelse 0;
-    var checks_passed = true;
-
-    if (version == .v3_0_0) {
-        const cal = data.calibrateLatencyV3(y);
-        calibration = cal;
-        if (manual_latency == null) {
-            latency = cal.recommended orelse {
-                try stdout.writeAll("error: latency blips not detected; pass --latency or re-record\n");
-                return error.LatencyNotDetected;
-            };
-        }
-        if (cal.warn_matches_lookahead) try stdout.writeAll("warning: latency trigger fired at the scan start (noisy capture?)\n");
-
-        const check = data.checkV3(x.len, y);
-        checks_passed = check.passed;
-        try stdout.print("v3 capture detected; latency {d} samples; replicate self-ESR {d:.6} ({s})\n", .{ latency, check.replicate_esr, if (check.passed) "ok" else "FAILED" });
-        if (!check.passed and !ignore_checks) {
-            try stdout.writeAll("error: validation replicates disagree (> 0.01 self-ESR): noise/gate/time-based FX or drift. Use --ignore-checks to proceed anyway.\n");
-            return error.DataChecksFailed;
-        }
-        // The v3 split slices x/y as [train_start .. len - t_validate] and
-        // [len - t_validate ..]; a reamp shorter than train_start + t_validate
-        // would make the train end precede its start (and underflow the usize
-        // subtraction). checkV3 only sizes the validation windows, so guard here.
-        const v3_min = data.v3.train_start + data.v3.t_validate;
-        if (x.len < v3_min or y.len < v3_min) {
-            try stdout.writeAll("error: capture too short — the v3 input/reamp is missing the training/validation tail; re-record the full file\n");
-            return error.CaptureTooShort;
-        }
-        try checkV3InputPreSilence(x);
-
-        const train_pair = try data.applyDelay(x[data.v3.train_start .. x.len - data.v3.t_validate], y[data.v3.train_start .. y.len - data.v3.t_validate], latency);
-        const val_pair = try data.applyDelay(x[x.len - data.v3.t_validate ..], y[y.len - data.v3.t_validate ..], latency);
-        try data.checkOutputNotClipped(train_pair.y);
-        try data.checkOutputNotClipped(val_pair.y);
-        return .{ .version = version, .latency = latency, .calibration = calibration, .checks_passed = checks_passed, .train_x = train_pair.x, .train_y = train_pair.y, .val_x = val_pair.x, .val_y = val_pair.y };
-    }
-
-    // Generic pair: -9 s validation tail (single_pair.json), manual latency.
-    if (manual_latency == null) {
-        try stdout.writeAll("note: unrecognized capture signal; assuming --latency 0 (pass it explicitly if your interface has loopback delay)\n");
-    }
-    const n = @min(x.len, y.len);
-    var val_len: usize = @intFromFloat(9.0 * data.standard_sample_rate);
-    if (val_len * 2 > n) {
-        val_len = n / 4; // short clips: hold out the last quarter
-        try stdout.writeAll("note: short capture; holding out the last 25% for validation instead of 9 s\n");
-    }
-    const train_pair = try data.applyDelay(x[0 .. n - val_len], y[0 .. n - val_len], latency);
-    const val_pair = try data.applyDelay(x[n - val_len .. n], y[n - val_len .. n], latency);
-    try data.checkOutputNotClipped(train_pair.y);
-    try data.checkOutputNotClipped(val_pair.y);
-    return .{ .version = version, .latency = latency, .calibration = calibration, .checks_passed = checks_passed, .train_x = train_pair.x, .train_y = train_pair.y, .val_x = val_pair.x, .val_y = val_pair.y };
-}
-
-fn validationEsrConfig(allocator: std.mem.Allocator, config: *const nam_file.WaveNetConfig, weights: []const f32, val_x: []const f32, val_y: []const f32, nx: usize) !f64 {
-    const pred = try allocator.alloc(f32, val_x.len);
-    defer allocator.free(pred);
-    try train_mod.renderWaveNetConfig(allocator, config, weights, val_x, pred);
-    return data.esr(pred[nx - 1 ..], val_y[nx - 1 ..]);
-}
-
-fn validationEsrLstm(allocator: std.mem.Allocator, config: *const nam_file.LstmConfig, weights: []const f32, val_x: []const f32, val_y: []const f32, nx: usize) !f64 {
-    const pred = try allocator.alloc(f32, val_x.len);
-    defer allocator.free(pred);
-    try train_mod.renderLstmConfig(allocator, config, weights, val_x, pred);
-    return data.esr(pred[nx - 1 ..], val_y[nx - 1 ..]);
-}
-
-fn validationEsrSnapshot(allocator: std.mem.Allocator, snapshot: *const train_mod.TrainingSnapshot, val_x: []const f32, val_y: []const f32, nx: usize) !f64 {
-    return switch (snapshot.*) {
-        .wavenet => |*s| try validationEsrConfig(allocator, &s.config, s.weights, val_x, val_y, nx),
-        .lstm => |*s| try validationEsrLstm(allocator, &s.config, s.weights, val_x, val_y, nx),
-        .packed_wavenet => |*packed_snapshot| blk: {
-            var total: f64 = 0;
-            for (packed_snapshot.submodels) |*submodel| {
-                total += try validationEsrConfig(allocator, &submodel.config, submodel.weights, val_x, val_y, nx);
-            }
-            break :blk total / @as(f64, @floatFromInt(packed_snapshot.submodels.len));
-        },
-    };
+    const cost = try profiler.measureTrainStep(io, allocator, spec, ny);
+    try stdout.print("train step {s}: nx {d} ny {d}: {d:.2} ms (loss + backward, best of 3)\n", .{ spec.name(), cost.nx, cost.ny, cost.ms });
 }
 
 fn train(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, args: []const []const u8) !void {
     var input_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
     var out_path: ?[]const u8 = null;
-    var init_path: ?[]const u8 = null;
-    var spec = train_mod.TrainingSpec{ .classic = train_mod.ModelSpec.classic };
-    var epochs_override: ?usize = null;
-    var batch_size: usize = 16;
-    var ny: usize = 8192;
-    var lr_override: ?f32 = null;
-    var weight_decay_override: ?f32 = null;
-    var gamma_override: ?f32 = null;
-    var mrstft_weight_override: ?f32 = null;
-    var seed: u64 = 0;
-    var manual_latency: ?i64 = null;
-    var ignore_checks = false;
-    var user = nam_export.UserMetadata{};
+    var config = profiler.TrainConfig{ .input_path = undefined, .output_path = undefined, .out_path = undefined };
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -687,212 +446,52 @@ fn train(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, args:
         } else if (std.mem.eql(u8, arg, "--out")) {
             out_path = try nextArg(args, &i);
         } else if (std.mem.eql(u8, arg, "--init")) {
-            init_path = try nextArg(args, &i);
+            config.init_path = try nextArg(args, &i);
         } else if (std.mem.eql(u8, arg, "--spec")) {
-            const v = try nextArg(args, &i);
-            spec = try train_mod.TrainingSpec.parse(v);
+            config.spec = try train_mod.TrainingSpec.parse(try nextArg(args, &i));
         } else if (std.mem.eql(u8, arg, "--epochs")) {
-            epochs_override = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
+            config.epochs = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, arg, "--batch")) {
-            batch_size = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
+            config.batch_size = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, arg, "--ny")) {
-            ny = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
+            config.ny = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, arg, "--lr")) {
-            lr_override = try std.fmt.parseFloat(f32, try nextArg(args, &i));
+            config.lr = try std.fmt.parseFloat(f32, try nextArg(args, &i));
         } else if (std.mem.eql(u8, arg, "--weight-decay")) {
-            weight_decay_override = try std.fmt.parseFloat(f32, try nextArg(args, &i));
+            config.weight_decay = try std.fmt.parseFloat(f32, try nextArg(args, &i));
         } else if (std.mem.eql(u8, arg, "--gamma")) {
-            gamma_override = try std.fmt.parseFloat(f32, try nextArg(args, &i));
+            config.gamma = try std.fmt.parseFloat(f32, try nextArg(args, &i));
         } else if (std.mem.eql(u8, arg, "--mrstft-weight")) {
-            mrstft_weight_override = try std.fmt.parseFloat(f32, try nextArg(args, &i));
+            config.mrstft_weight = try std.fmt.parseFloat(f32, try nextArg(args, &i));
         } else if (std.mem.eql(u8, arg, "--seed")) {
-            seed = try std.fmt.parseInt(u64, try nextArg(args, &i), 10);
+            config.seed = try std.fmt.parseInt(u64, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, arg, "--latency")) {
-            manual_latency = try std.fmt.parseInt(i64, try nextArg(args, &i), 10);
+            config.latency = try std.fmt.parseInt(i64, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, arg, "--ignore-checks")) {
-            ignore_checks = true;
+            config.ignore_checks = true;
         } else if (std.mem.eql(u8, arg, "--name")) {
-            user.name = try nextArg(args, &i);
+            config.user.name = try nextArg(args, &i);
         } else if (std.mem.eql(u8, arg, "--modeled-by")) {
-            user.modeled_by = try nextArg(args, &i);
+            config.user.modeled_by = try nextArg(args, &i);
         } else if (std.mem.eql(u8, arg, "--gear-type")) {
-            user.gear_type = try nextArg(args, &i);
+            config.user.gear_type = try nextArg(args, &i);
         } else if (std.mem.eql(u8, arg, "--gear-make")) {
-            user.gear_make = try nextArg(args, &i);
+            config.user.gear_make = try nextArg(args, &i);
         } else if (std.mem.eql(u8, arg, "--gear-model")) {
-            user.gear_model = try nextArg(args, &i);
+            config.user.gear_model = try nextArg(args, &i);
         } else if (std.mem.eql(u8, arg, "--tone-type")) {
-            user.tone_type = try nextArg(args, &i);
+            config.user.tone_type = try nextArg(args, &i);
         } else return error.UnknownArgument;
     }
     if (input_path == null or output_path == null or out_path == null) {
         try stdout.writeAll("usage: nam-zig train --input in.wav --output reamp.wav --out model.nam [--spec standard|tiny|a2|a2-nano|packed | --init model.nam] [options]\n");
         return;
     }
-    if (batch_size == 0) {
-        try stdout.writeAll("error: --batch must be > 0\n");
-        return error.InvalidBatchSize;
-    }
-    if (ny == 0) {
-        try stdout.writeAll("error: --ny must be > 0\n");
-        return error.InvalidNy;
-    }
-    const epochs = epochs_override orelse spec.defaultEpochs();
-    const lr0 = lr_override orelse spec.defaultLr();
-    const weight_decay = weight_decay_override orelse spec.defaultWeightDecay();
-    const gamma = gamma_override orelse spec.defaultGamma();
-    const mrstft_weight = mrstft_weight_override orelse spec.defaultMrstftWeight();
-    const loss_options = train_mod.LossOptions{ .mrstft_weight = mrstft_weight };
-
-    const input_bytes = try wav.readFileBytes(io, allocator, input_path.?);
-    defer allocator.free(input_bytes);
-    var input_wav = try wav.parse(allocator, input_bytes);
-    defer input_wav.deinit();
-    var output_wav = try wav.readFile(io, allocator, output_path.?);
-    defer output_wav.deinit();
-    const x = try input_wav.requireMono();
-    const y = try output_wav.requireMono();
-    if (input_wav.sample_rate != output_wav.sample_rate) return error.SampleRateMismatch;
-    if (input_wav.sample_rate != 48000) {
-        try stdout.print("error: training expects 48 kHz captures (got {d} Hz)\n", .{input_wav.sample_rate});
-        return error.SampleRateMismatch;
-    }
-
-    var init_model: ?nam_file.NamModel = null;
-    defer if (init_model) |*model| model.deinit();
-    var owned_template_config: ?nam_file.WaveNetConfig = null;
-    defer if (owned_template_config) |*config| train_mod.freeEngineConfig(allocator, config);
-    var template_config: ?*const nam_file.WaveNetConfig = null;
-    var train_name: []const u8 = undefined;
-    if (init_path) |path| {
-        init_model = try nam_file.loadFile(io, allocator, path);
-        const loaded = &init_model.?;
-        switch (loaded.config) {
-            .wavenet => |*config| {
-                template_config = config;
-                train_name = "loaded-wavenet";
-            },
-            else => {
-                try stdout.writeAll("error: --init currently trains WaveNet .nam files only\n");
-                return error.UnsupportedArchitecture;
-            },
-        }
-    } else {
-        switch (spec) {
-            .packed_wavenet, .lstm => {
-                train_name = spec.name();
-            },
-            else => {
-                owned_template_config = try spec.makeEngineConfig(allocator);
-                template_config = &owned_template_config.?;
-                train_name = spec.name();
-            },
-        }
-    }
-
-    const splits = try resolveSplits(stdout, input_bytes, x, y, manual_latency, ignore_checks);
-    var normalized = try normalizeJointOutput(allocator, splits.train_y, splits.val_y);
-    defer normalized.deinit(allocator);
-    const nx = if (template_config) |config| config.receptiveField() else spec.receptiveField();
-    const dataset = data.Dataset{ .x = splits.train_x, .y = normalized.train_y, .nx = nx, .ny = ny };
-    const example_count = dataset.len();
-    const steps_per_epoch = example_count / batch_size;
-    if (steps_per_epoch == 0) return error.NotEnoughTrainingData;
-    if (splits.val_x.len <= nx) return error.NotEnoughValidationData;
-
-    try stdout.print("training {s} spec: {d} examples (ny {d}), {d} steps/epoch x {d} epochs, batch {d}, lr {d}, gamma {d}, wd {d}, mrstft {d}, output scale {d}\n", .{
-        train_name, example_count, ny, steps_per_epoch, epochs, batch_size, lr0, gamma, weight_decay, mrstft_weight, normalized.train_scale,
-    });
-    try stdout.flush();
-
-    var ctx: fucina.ExecContext = undefined;
-    ctx.init(allocator);
-    defer ctx.deinit();
-
-    var model: train_mod.ActiveTrainable = undefined;
-    if (init_model) |*loaded| {
-        model = .{ .wavenet = try wavenet_mod.WaveNet.init(allocator, &ctx, template_config.?, loaded.weights, .{ .trainable = true }) };
-    } else {
-        model = try spec.initTrainable(allocator, &ctx, seed);
-    }
-    defer model.deinit();
-    var opt = try fucina.optim.Adam.init(allocator, .{ .lr = lr0, .weight_decay = weight_decay });
-    defer opt.deinit();
-    try model.registerParams(&opt);
-
-    const order = try allocator.alloc(usize, example_count);
-    defer allocator.free(order);
-    for (order, 0..) |*v, idx| v.* = idx;
-
-    var best_snapshot: ?train_mod.TrainingSnapshot = null;
-    defer if (best_snapshot) |*snapshot| snapshot.deinit(allocator);
-    var best_esr = std.math.inf(f64);
-
-    for (0..epochs) |epoch| {
-        opt.config.lr = lr0 * std.math.pow(f32, gamma, @floatFromInt(epoch));
-        // Deterministic shuffle (Fisher-Yates over rng.at counters).
-        for (0..example_count) |idx| {
-            const j = idx + rng.at(seed +% 0x5851f42d4c957f2d, epoch * example_count + idx) % (example_count - idx);
-            std.mem.swap(usize, &order[idx], &order[j]);
-        }
-
-        const epoch_start = nowNs(io);
-        var loss_sum: f64 = 0;
-        for (0..steps_per_epoch) |step_index| {
-            for (order[step_index * batch_size ..][0..batch_size]) |example_index| {
-                const example = dataset.get(example_index);
-                const scope = ctx.openExecScope();
-                defer ctx.closeExecScope(scope);
-                const loss = try model.segmentLossWithOptions(&ctx, example.input, example.target, loss_options);
-                var scaled = try loss.scale(&ctx, 1.0 / @as(f32, @floatFromInt(batch_size)));
-                loss_sum += try loss.item();
-                try scaled.backward(&ctx);
-            }
-            try opt.step(&ctx);
-            opt.zeroGrad();
-        }
-
-        var snapshot = try model.extractTrainingSnapshot(&ctx, allocator, template_config);
-        const val_esr = try validationEsrSnapshot(allocator, &snapshot, splits.val_x, normalized.val_y, nx);
-        const epoch_seconds = @as(f64, @floatFromInt(@as(u64, @intCast(nowNs(io) - epoch_start)))) / 1e9;
-        const improved = val_esr < best_esr;
-        if (improved) {
-            best_esr = val_esr;
-            if (best_snapshot) |*old| old.deinit(allocator);
-            best_snapshot = snapshot;
-        } else {
-            snapshot.deinit(allocator);
-        }
-        try stdout.print("epoch {d:>3}/{d}: train loss {d:.6}  val ESR {d:.6}{s}  ({d:.1}s)\n", .{
-            epoch + 1, epochs, loss_sum / @as(f64, @floatFromInt(steps_per_epoch * batch_size)), val_esr, if (improved) " *" else "", epoch_seconds,
-        });
-        try stdout.flush();
-    }
-
-    const final_snapshot = if (best_snapshot) |*snapshot| snapshot else return error.NoEpochsRun;
-    try stdout.print("validation ESR {d:.6} — {s}\n", .{ best_esr, data.esrComment(best_esr) });
-
-    const unix_seconds: u64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
-    const export_info = nam_export.ExportInfo{
-        .user = user,
-        .training = .{
-            .ignore_checks = ignore_checks,
-            .latency_manual = manual_latency,
-            .calibration = splits.calibration,
-            .checks_version = 3,
-            .checks_passed = splits.checks_passed,
-            .validation_esr = best_esr,
-        },
-        .unix_seconds = unix_seconds,
-        .sample_rate = 48000.0,
-        .output_scale_compensation = normalized.exportCompensation(),
-    };
-    switch (final_snapshot.*) {
-        .wavenet => |*snapshot| try nam_export.exportWaveNetConfig(io, allocator, out_path.?, &snapshot.config, snapshot.weights, export_info),
-        .packed_wavenet => |*snapshot| try nam_export.exportSlimmableContainer(io, allocator, out_path.?, snapshot.submodels, export_info),
-        .lstm => |*snapshot| try nam_export.exportLstmConfig(io, allocator, out_path.?, &snapshot.config, snapshot.weights, export_info),
-    }
-    try stdout.print("exported {s}\n", .{out_path.?});
+    config.input_path = input_path.?;
+    config.output_path = output_path.?;
+    config.out_path = out_path.?;
+    var progress = profiler.StdoutReporter{ .io = io, .stdout = stdout };
+    _ = try profiler.trainPair(io, allocator, progress.reporter(), config);
 }
 
 fn validate(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, args: []const []const u8) !void {
@@ -931,7 +530,8 @@ fn validate(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, ar
     const x = try input_wav.requireMono();
     const y = try output_wav.requireMono();
 
-    const splits = try resolveSplits(stdout, input_bytes, x, y, manual_latency, true);
+    var progress = profiler.StdoutReporter{ .io = io, .stdout = stdout };
+    const splits = try profiler.resolveSplits(progress.reporter(), input_bytes, x, y, manual_latency, true);
 
     var engine = try engine_mod.Engine.init(allocator, &model);
     defer engine.deinit();
@@ -1025,30 +625,6 @@ fn importGguf(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, 
     try stdout.print("recovered {s} (byte-identical to the .nam embedded at conversion)\n", .{args[1]});
 }
 
-const CaptureState = struct {
-    signal: []const f32,
-    recorded: []f32,
-    cursor: std.atomic.Value(usize) = .init(0),
-    in_peak_bits: std.atomic.Value(u32) = .init(0),
-};
-
-fn captureCallback(user: ?*anyopaque, output: ?[*]f32, input: ?[*]const f32, frame_count: c_uint) callconv(.c) void {
-    const state: *CaptureState = @ptrCast(@alignCast(user.?));
-    const frames: usize = frame_count;
-    const out = output orelse return;
-    const in = input orelse return;
-    var pos = state.cursor.load(.monotonic);
-    var in_peak: f32 = @bitCast(state.in_peak_bits.load(.monotonic));
-    for (0..frames) |i| {
-        out[i] = if (pos < state.signal.len) state.signal[pos] else 0.0;
-        if (pos < state.recorded.len) state.recorded[pos] = in[i];
-        in_peak = @max(in_peak, @abs(in[i]));
-        pos += 1;
-    }
-    state.in_peak_bits.store(@bitCast(in_peak), .monotonic);
-    state.cursor.store(pos, .release);
-}
-
 fn profileCapture(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, env: *const home_mod.Env, args: []const []const u8) !void {
     var signal_path: ?[]const u8 = null;
     var reamp_path: ?[]const u8 = null;
@@ -1091,11 +667,11 @@ fn profileCapture(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writ
     const home = try home_mod.Home.resolve(allocator, io, env);
     try home.ensure();
     if (signal_path == null) signal_path = try home.ensureCaptureSignal(stdout);
-    const slug = try slugify(allocator, name);
-    if (reamp_path == null) reamp_path = try uniquePath(allocator, io, home.captures, slug, "-reamp.wav");
+    const slug = try profiler.slugify(allocator, name);
+    if (reamp_path == null) reamp_path = try profiler.uniquePath(allocator, io, home.captures, slug, "-reamp.wav");
     if (!has_out) {
         try train_args.append(allocator, "--out");
-        try train_args.append(allocator, try uniquePath(allocator, io, home.profiles, slug, ".nam"));
+        try train_args.append(allocator, try profiler.uniquePath(allocator, io, home.profiles, slug, ".nam"));
     }
     if (gui_mod.micRequest(120_000) == .denied) {
         try stdout.writeAll("error: microphone access is denied; allow it in System Settings, Privacy & Security, Microphone\n");
@@ -1105,41 +681,22 @@ fn profileCapture(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writ
     var signal_wav = try wav.readFile(io, allocator, signal_path.?);
     defer signal_wav.deinit();
     const signal = try signal_wav.requireMono();
-    if (signal_wav.sample_rate != 48000) {
+    if (signal_wav.sample_rate != profiler.sample_rate) {
         try stdout.print("error: capture signal must be 48 kHz (got {d})\n", .{signal_wav.sample_rate});
         return error.SampleRateMismatch;
     }
 
-    // Record the signal length plus a 1 s tail (latency + reverb decay).
-    const total = signal.len + 48000;
-    const recorded = try allocator.alloc(f32, total);
-    defer allocator.free(recorded);
-    @memset(recorded, 0);
-
-    var state = CaptureState{ .signal = signal, .recorded = recorded };
     var audio = try audio_mod.Audio.init();
     defer audio.deinit();
 
     try stdout.print("reamping {d:.1}s through the device chain — plug the interface output into the amp/pedal input and the return into the capture channel\n", .{@as(f64, @floatFromInt(signal.len)) / 48000.0});
     try stdout.flush();
 
-    try audio.start(capture_index, playback_index, 48000, period, captureCallback, &state);
-    while (state.cursor.load(.acquire) < total) {
-        const pos = state.cursor.load(.monotonic);
-        const in_peak: f32 = @bitCast(state.in_peak_bits.load(.monotonic));
-        ui.statusLine(io, "capturing {d:>5.1}s / {d:.1}s   input peak {d:>6.1} dB", .{
-            @as(f64, @floatFromInt(pos)) / 48000.0, @as(f64, @floatFromInt(total)) / 48000.0, ui.dbfs(in_peak),
-        });
-        std.Io.sleep(io, .{ .nanoseconds = 200 * std.time.ns_per_ms }, .awake) catch {};
-    }
-    audio.stop();
+    // Records the signal plus a 1 s tail (latency + reverb decay).
+    var progress = profiler.StdoutReporter{ .io = io, .stdout = stdout };
+    const recorded = try profiler.captureReamp(io, allocator, &audio, progress.reporter(), signal, .{ .capture = capture_index, .playback = playback_index, .period = period });
+    defer allocator.free(recorded);
     ui.plainLine(io, "", .{});
-
-    const final_peak: f32 = @bitCast(state.in_peak_bits.load(.monotonic));
-    if (final_peak < 1e-4) {
-        try stdout.writeAll("error: the capture channel recorded silence — check cabling and macOS microphone permission for this terminal\n");
-        return error.SilentCapture;
-    }
 
     try wav.writeMono(io, allocator, reamp_path.?, recorded, 48000, .float32);
     try stdout.print("saved reamp to {s}; training...\n", .{reamp_path.?});
@@ -1497,58 +1054,6 @@ fn live(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, args: 
 }
 
 /// A file-name stem from a free-text name: letters, digits, `-` and `_`.
-fn slugify(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-    var out = try allocator.alloc(u8, @max(name.len, 1));
-    var n: usize = 0;
-    var last_dash = true;
-    for (name) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '_') {
-            out[n] = c;
-            n += 1;
-            last_dash = false;
-        } else if (!last_dash) {
-            out[n] = '-';
-            n += 1;
-            last_dash = true;
-        }
-    }
-    while (n > 0 and out[n - 1] == '-') n -= 1;
-    if (n == 0) {
-        out[0] = 'p';
-        n = 1;
-    }
-    return allocator.realloc(out, n);
-}
-
-/// `<dir>/<stem><suffix>`, or `<stem>-2<suffix>`, `-3`, ... when taken.
-fn uniquePath(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []const u8, suffix: []const u8) ![]const u8 {
-    var attempt: usize = 1;
-    while (attempt < 1000) : (attempt += 1) {
-        const file = if (attempt == 1)
-            try std.fmt.allocPrint(allocator, "{s}{s}", .{ stem, suffix })
-        else
-            try std.fmt.allocPrint(allocator, "{s}-{d}{s}", .{ stem, attempt, suffix });
-        const path = try std.fs.path.join(allocator, &.{ dir, file });
-        std.Io.Dir.cwd().access(io, path, .{}) catch return path;
-    }
-    return error.TooManyFiles;
-}
-
-test "slugify keeps letters, digits, underscores; folds the rest into single dashes" {
-    const allocator = std.testing.allocator;
-    const cases = [_][2][]const u8{
-        .{ "My Amp", "My-Amp" },
-        .{ "  Deluxe / Reverb (crunch)!! ", "Deluxe-Reverb-crunch" },
-        .{ "plain_name", "plain_name" },
-        .{ "///", "p" },
-    };
-    for (cases) |c| {
-        const got = try slugify(allocator, c[0]);
-        defer allocator.free(got);
-        try std.testing.expectEqualStrings(c[1], got);
-    }
-}
-
 fn openHome(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, env: *const home_mod.Env) !void {
     const home = try home_mod.Home.resolve(allocator, io, env);
     try home.ensure();
@@ -1613,6 +1118,7 @@ fn gui(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, env: *c
         }
     }
 
+    app.shutdownJob();
     server.stop();
     server_thread.join();
     tick_thread.join();
@@ -1729,8 +1235,6 @@ fn doctor(io: std.Io, allocator: std.mem.Allocator, stdout: *std.Io.Writer, env:
     }
 }
 
-const rng = fucina.rng;
-
 test {
     _ = @import("profiles.zig");
     _ = @import("home.zig");
@@ -1750,4 +1254,6 @@ test {
     _ = @import("tuner.zig");
     _ = @import("ui.zig");
     _ = @import("lstm.zig");
+    _ = @import("profiler.zig");
+    _ = @import("profile_job.zig");
 }

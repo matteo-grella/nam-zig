@@ -9,6 +9,7 @@ const audio_mod = @import("audio.zig");
 const ui = @import("ui.zig");
 const home_mod = @import("home.zig");
 const profiles_mod = @import("profiles.zig");
+const profile_job = @import("profile_job.zig");
 
 extern fn nam_mic_status() c_int;
 extern fn nam_mic_request(timeout_ms: c_uint) c_int;
@@ -66,11 +67,11 @@ pub fn micRequest(timeout_ms: u32) MicStatus {
     };
 }
 
-fn lock(m: *std.Io.Mutex) void {
+pub fn lock(m: *std.Io.Mutex) void {
     std.Io.Threaded.mutexLock(m);
 }
 
-fn unlock(m: *std.Io.Mutex) void {
+pub fn unlock(m: *std.Io.Mutex) void {
     std.Io.Threaded.mutexUnlock(m);
 }
 
@@ -118,6 +119,8 @@ pub const Gui = struct {
     view: ?ui.View = null,
     quit: std.atomic.Value(bool) = .init(false),
     mic: MicStatus = .undetermined,
+    /// The amp capture wizard's worker (stable address: the Gui is heap-allocated).
+    job: profile_job.Job,
 
     pub const Options = struct {
         period: ?u32 = null,
@@ -169,7 +172,9 @@ pub const Gui = struct {
             .audio = undefined,
             .set = undefined,
             .session = undefined,
+            .job = undefined,
         };
+        self.job = profile_job.Job.init(self);
         self.mic = if (opts.request_mic) micRequest(30_000) else micStatus();
 
         self.audio = try audio_mod.Audio.init();
@@ -202,6 +207,7 @@ pub const Gui = struct {
     }
 
     pub fn destroy(self: *Gui) void {
+        self.job.shutdown();
         self.session.destroy();
         self.set.deinit();
         self.audio.deinit();
@@ -236,7 +242,7 @@ pub const Gui = struct {
         return set;
     }
 
-    fn selectChainByName(self: *Gui, name: []const u8) void {
+    pub fn selectChainByName(self: *Gui, name: []const u8) void {
         for (self.set.chains, 0..) |c, i| {
             if (std.mem.eql(u8, c.name, name)) {
                 self.session.selectChain(i);
@@ -246,8 +252,10 @@ pub const Gui = struct {
     }
 
     /// Reloads the profiles folder (new files appear, removed ones go) and
-    /// keeps the current chain by name when it still exists.
-    fn rescanLocked(self: *Gui) !void {
+    /// keeps the current chain by name when it still exists. With
+    /// `restart_audio` false the stream stays stopped (the amp capture
+    /// holds the devices).
+    pub fn rescanLocked(self: *Gui, restart_audio: bool) !void {
         var name_buf: [256]u8 = undefined;
         var name_len: usize = 0;
         if (self.set.chains.len > 0) {
@@ -257,7 +265,7 @@ pub const Gui = struct {
         }
         var new_set = try self.buildSet();
         errdefer new_set.deinit();
-        try self.session.swapChains(new_set.chains);
+        if (restart_audio) try self.session.swapChains(new_set.chains) else self.session.replaceChains(new_set.chains);
         var old = self.set;
         self.set = new_set;
         old.deinit();
@@ -277,6 +285,12 @@ pub const Gui = struct {
 
     pub fn requestQuit(self: *Gui) void {
         self.quit.store(true, .release);
+    }
+
+    /// Ends a running amp capture (keeping a training run's best epoch)
+    /// before the app quits.
+    pub fn shutdownJob(self: *Gui) void {
+        self.job.shutdown();
     }
 
     pub fn saveConfig(self: *Gui) void {
@@ -307,6 +321,13 @@ pub const Gui = struct {
         defer unlock(&self.mutex);
         const s = self.session;
         var save = false;
+        // While the amp capture holds the devices, controls that would
+        // reopen the stream are ignored (the page hides them too).
+        const devices_locked = self.job.audio_held;
+        var request = profile_job.Request{};
+        var start_job = false;
+        var train_anyway = false;
+        var retry = false;
         var pairs = std.mem.splitScalar(u8, query, '&');
         while (pairs.next()) |pair| {
             if (pair.len == 0) continue;
@@ -338,25 +359,59 @@ pub const Gui = struct {
                 s.selectChain(parseIndex(value) orelse continue);
                 save = true;
             } else if (std.mem.eql(u8, key, "capture")) {
+                if (devices_locked) continue;
                 s.selectCapture(parseIndex(value));
                 save = true;
             } else if (std.mem.eql(u8, key, "playback")) {
+                if (devices_locked) continue;
                 s.selectPlayback(parseIndex(value));
                 save = true;
             } else if (std.mem.eql(u8, key, "auto_input")) {
+                if (devices_locked) continue;
                 s.autoInput();
                 save = true;
             } else if (std.mem.eql(u8, key, "accept_twin")) {
+                if (devices_locked) continue;
                 s.acceptSuggestion();
                 save = true;
             } else if (std.mem.eql(u8, key, "clear")) {
                 s.clearWarnings();
             } else if (std.mem.eql(u8, key, "rescan")) {
-                try self.rescanLocked();
+                try self.rescanLocked(!devices_locked);
             } else if (std.mem.eql(u8, key, "open_folder")) {
                 self.home.openInFileManager(self.home.profiles);
+            } else if (std.mem.eql(u8, key, "open_home")) {
+                self.home.openInFileManager(self.home.root);
+            } else if (std.mem.eql(u8, key, "open_url")) {
+                // Only the capture signal's download page.
+                var buf: [512]u8 = undefined;
+                if (std.mem.eql(u8, profile_job.percentDecode(value, &buf), home_mod.capture_signal_page)) home_mod.openExternal(self.io, home_mod.capture_signal_page);
+            } else if (std.mem.startsWith(u8, key, "profile_")) {
+                const sub = key["profile_".len..];
+                if (std.mem.eql(u8, sub, "open")) {
+                    self.job.ensureEstimate();
+                } else if (std.mem.eql(u8, sub, "start")) {
+                    start_job = true;
+                } else if (std.mem.eql(u8, sub, "capture")) {
+                    self.job.send(.advance);
+                } else if (std.mem.eql(u8, sub, "finish")) {
+                    self.job.send(.finish);
+                } else if (std.mem.eql(u8, sub, "cancel")) {
+                    self.job.send(.cancel);
+                } else if (std.mem.eql(u8, sub, "dismiss")) {
+                    self.job.dismissLocked();
+                } else if (std.mem.eql(u8, sub, "train_anyway")) {
+                    train_anyway = true;
+                } else if (std.mem.eql(u8, sub, "retry")) {
+                    retry = true;
+                } else {
+                    _ = request.setField(sub, value);
+                }
             }
         }
+        if (start_job) try self.job.start(request);
+        if (train_anyway) try self.job.startTrainAnyway();
+        if (retry) try self.job.restart();
         // The reply carries the new state, not the last tick's snapshot.
         self.view = null;
         if (save) self.saveConfigLocked();
@@ -438,6 +493,8 @@ pub const Gui = struct {
         try jsonString(w, self.home.root);
         try w.writeAll(",\"profiles_dir\":");
         try jsonString(w, self.home.profiles);
+        try w.writeAll(",\"profiler\":");
+        try self.job.writeJson(w);
         try w.writeAll("}");
     }
 };

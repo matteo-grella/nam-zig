@@ -917,10 +917,17 @@ pub const Session = struct {
     /// Replaces the chain set while the stream is stopped; `chains` must
     /// outlive the session's use of it (the caller owns the ChainSet).
     pub fn swapChains(self: *Session, chains: []Chain) !void {
+        self.replaceChains(chains);
+        if (chains.len > 0) try self.startAudio();
+    }
+
+    /// `swapChains` without restarting the stream: for a caller that holds
+    /// the devices for something else (the window's amp capture) and
+    /// restarts the stream itself later.
+    pub fn replaceChains(self: *Session, chains: []Chain) void {
         self.stopAudio();
         self.shared.chains = chains;
         self.shared.current.store(0, .release);
-        if (chains.len > 0) try self.startAudio();
     }
 
     pub fn latency(self: *Session) LatencyInfo {
