@@ -1,8 +1,9 @@
 //! Behavioral tests for the live tuner (tuner.zig): note naming, SPSC tap
-//! semantics, mono accuracy on pure and inharmonic-plucked tones (including
-//! octave robustness with a weak fundamental), silence/noise rejection, and
-//! the polyphonic strum check with harmonic-ghost masking. All signals are
-//! synthesized deterministically; accuracy assertions are in cents.
+//! semantics, mono accuracy on pure, inharmonic-plucked and stiff tones
+//! (including octave robustness with a weak fundamental), silence/noise
+//! rejection, and the polyphonic strum check with harmonic-ghost masking
+//! and its one-note guard. All signals are synthesized deterministically;
+//! accuracy assertions are in cents.
 
 const std = @import("std");
 const tuner = @import("tuner.zig");
@@ -30,6 +31,14 @@ fn synthInto(buf: []f32, fs: f64, f0: f64, partials: []const Partial, b_inh: f64
 }
 
 const pure = [_]Partial{.{ .k = 1, .amp = 1 }};
+
+/// A wound low string through a pickup: the 2nd and 3rd partials louder
+/// than the fundamental, then a gentle rolloff.
+const pickup_rich = [_]Partial{
+    .{ .k = 1, .amp = 0.6 },  .{ .k = 2, .amp = 1.0 },  .{ .k = 3, .amp = 0.8 },
+    .{ .k = 4, .amp = 0.5 },  .{ .k = 5, .amp = 0.35 }, .{ .k = 6, .amp = 0.25 },
+    .{ .k = 7, .amp = 0.18 }, .{ .k = 8, .amp = 0.12 },
+};
 
 /// Feed `samples` in callback-sized chunks, running a mono analysis at the
 /// live thread's cadence; returns the last result.
@@ -227,6 +236,48 @@ test "mono: weak fundamental with dominant harmonics keeps the right octave" {
     try expectCentsWithin(r.f1, f1_true, 1.0);
 }
 
+test "mono: stiff strings hold 0.1 cent on every frame" {
+    const an = try newAnalyzer(48000, 440.0);
+    defer std.testing.allocator.destroy(an);
+    const allocator = std.testing.allocator;
+    const samples = try allocator.alloc(f32, 48000);
+    defer allocator.free(samples);
+
+    // Stiff strings push the higher partials up to ~15 cents sharp of k·f0,
+    // so the per-partial refinement starts well off its coarse grid. The
+    // search used to stop short of the peak by up to a cent whenever the
+    // peak sat more than ~1 cent from a grid point, and the reading moved
+    // with it from frame to frame.
+    const cases = [_]struct { f1: f64, b: f64 }{
+        .{ .f1 = 82.4069, .b = 6e-4 },
+        .{ .f1 = 196.0, .b = 1e-3 },
+        .{ .f1 = 246.9417, .b = 1e-3 },
+        .{ .f1 = 329.6276, .b = 6e-4 },
+        .{ .f1 = 440.0, .b = 3e-4 },
+    };
+    for (cases) |case| {
+        an.reset();
+        @memset(samples, 0);
+        synthInto(samples, 48000, case.f1 / @sqrt(1.0 + case.b), &pickup_rich, case.b, 1.0, 0.12);
+        var fed: usize = 0;
+        var last: usize = 0;
+        var checked: usize = 0;
+        while (fed < samples.len) {
+            const n = @min(@as(usize, 480), samples.len - fed);
+            an.feed(samples[fed..][0..n]);
+            fed += n;
+            if (an.decimatedTotal() < last + 800) continue;
+            last = an.decimatedTotal();
+            const r = an.analyzeMono();
+            if (fed < 14400) continue; // let the lock and the median settle
+            try std.testing.expect(r.valid);
+            try expectCentsWithin(r.f1, case.f1, 0.1);
+            checked += 1;
+        }
+        try std.testing.expect(checked > 8);
+    }
+}
+
 test "mono: silence and noise are rejected" {
     const an = try newAnalyzer(48000, 440.0);
     defer std.testing.allocator.destroy(an);
@@ -338,6 +389,34 @@ test "poly: harmonic ghosts of sounding strings stay masked" {
     try std.testing.expect(!r.strings[5].active); // e: A2's 3rd partial, masked
     try std.testing.expectApproxEqAbs(@as(f64, 5), r.strings[1].cents, 3.0);
     try std.testing.expectApproxEqAbs(@as(f64, -7), r.strings[3].cents, 3.0);
+}
+
+test "poly: one low E with a pickup-rich spectrum is not a strum" {
+    const an = try newAnalyzer(48000, 440.0);
+    defer std.testing.allocator.destroy(an);
+    const allocator = std.testing.allocator;
+    const samples = try allocator.alloc(f32, 48000);
+    defer allocator.free(samples);
+    @memset(samples, 0);
+
+    // The low E's partials 3 and 4 land on the open B3 and E4 targets
+    // (82.4·3 = 247.2, 82.4·4 = 329.6), louder than the amplitude gate
+    // allows for. What tells them from strummed B and e strings is that
+    // nothing sounds that isn't a partial of E2 — one note for the needle,
+    // not a strum for the per-string row.
+    const b_inh = 2e-4;
+    const f1 = tuner.midiFreq(40, 440.0) * std.math.pow(f64, 2.0, -20.0 / 1200.0);
+    synthInto(samples, 48000, f1 / @sqrt(1.0 + b_inh), &pickup_rich, b_inh, 1.0, 0.12);
+
+    an.feed(samples);
+    const p = an.analyzePoly();
+    try std.testing.expectEqual(@as(u32, 0), p.active_count);
+
+    an.reset();
+    const r = runMono(an, samples, 48000);
+    try std.testing.expect(r.valid);
+    try std.testing.expectEqual(@as(i32, 40), r.midi);
+    try expectCentsWithin(r.f1, f1, 0.5);
 }
 
 test "poly: silence reports no strings" {

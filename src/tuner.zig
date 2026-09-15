@@ -31,12 +31,16 @@
 //!      2-frame hysteresis on the note name.
 //!
 //! Polyphonic strum check (PolyTune-style, standard tuning E A D G B e):
-//!   per-string harmonic-salience scan over ±120 cents around the expected
-//!   open frequency, fundamental refined like the mono path, then a
-//!   low-to-high masking pass so a lower string's exact-ratio partials
-//!   (E2·3 ≈ B3, A2·3 = E4, E2·4 = E4) don't read as a sounding higher
-//!   string. Per-string accuracy target ±2 cents; the mono path is the
-//!   precision instrument.
+//!   per-string fundamental scan over ±120 cents around the expected open
+//!   frequency, refined like the mono path, then a low-to-high masking pass
+//!   so a lower string's exact-ratio partials (E2·3 ≈ B3, A2·3 = E4,
+//!   E2·4 = E4) don't read as a sounding higher string. A pickup's low E
+//!   can carry partials louder than its fundamental, so amplitude alone
+//!   can't settle that: a window counts as a strum only when at least two
+//!   sounding strings are not partials of a lower one; otherwise it is one
+//!   (rich) note, the check reports nothing, and the mono path shows it.
+//!   Per-string accuracy target ±2 cents; the mono path is the precision
+//!   instrument.
 
 const std = @import("std");
 
@@ -435,7 +439,8 @@ pub const Analyzer = struct {
 
     /// Iterated 3-point parabolic maximization of |X(f)|² over
     /// [f0·2^(-band/1200), f0·2^(band/1200)]: a coarse 9-point scan, then 4
-    /// shrink-and-refit rounds. Final granularity ≈ band/2048 cents.
+    /// rounds that quarter the step, walk it to the local top, and refit
+    /// the parabola. Final granularity ≈ band/2048 cents.
     fn refinePeak(self: *const Analyzer, wx: []const f64, center: f64, band_cents: f64) Refined {
         const lo = center * centsFactor(-band_cents);
         const hi = center * centsFactor(band_cents);
@@ -452,18 +457,28 @@ pub const Analyzer = struct {
         var step = (hi - lo) / 8.0;
         for (0..4) |_| {
             step *= 0.25;
-            const pm = self.spectralPower(wx, best_f - step);
-            const pp = self.spectralPower(wx, best_f + step);
-            const den = pm - 2.0 * best_p + pp;
-            if (pm > best_p or pp > best_p) {
-                if (pp > pm) {
+            // Walk toward rising power first: the previous round's best can
+            // sit more than a step from the peak, and shrinking without the
+            // walk stalls short of it (by over a cent at the mono band).
+            var pm = self.spectralPower(wx, best_f - step);
+            var pp = self.spectralPower(wx, best_f + step);
+            var walked: usize = 0;
+            while (walked < 8 and (pm > best_p or pp > best_p)) : (walked += 1) {
+                if (pp >= pm) {
                     best_f += step;
+                    pm = best_p;
                     best_p = pp;
+                    pp = self.spectralPower(wx, best_f + step);
                 } else {
                     best_f -= step;
+                    pp = best_p;
                     best_p = pm;
+                    pm = self.spectralPower(wx, best_f - step);
                 }
-            } else if (@abs(den) > 0) {
+            }
+            // best_f now tops its bracketing triple: fit the parabola.
+            const den = pm - 2.0 * best_p + pp;
+            if (den < 0) {
                 const d = 0.5 * (pm - pp) / den * step;
                 const f = best_f + std.math.clamp(d, -step, step);
                 const p = self.spectralPower(wx, f);
@@ -655,20 +670,24 @@ pub const Analyzer = struct {
         for (det) |d| amp_all_max = @max(amp_all_max, d.amp);
 
         var out = PolyResult{};
+        var independent: u32 = 0;
         for (0..6) |s| {
             const d = det[s];
             if (d.edge) continue;
             if (d.amp < 3.2e-4 or d.amp < amp_all_max / 12.0) continue;
             // Masking: a lower ACTIVE string whose integer partial lands on
-            // this candidate (within 30 cents) explains it unless the
-            // candidate is clearly louder than that partial would be
-            // (expected rolloff ~ amp_lo/m).
+            // this candidate (within 30 cents) explains it, and masks it
+            // unless the candidate is clearly louder than that partial
+            // would be (expected rolloff ~ amp_lo/m).
+            var explained = false;
             var masked = false;
             for (0..s) |lo| {
                 if (!out.strings[lo].active) continue;
                 const m = @round(d.f / det[lo].f);
                 if (m < 2 or m > 8) continue;
-                if (@abs(centsBetween(d.f, det[lo].f * m)) < 30.0 and d.amp < 0.6 * det[lo].amp / m) {
+                if (@abs(centsBetween(d.f, det[lo].f * m)) >= 30.0) continue;
+                explained = true;
+                if (d.amp < 0.6 * det[lo].amp / m) {
                     masked = true;
                     break;
                 }
@@ -676,7 +695,16 @@ pub const Analyzer = struct {
             if (masked) continue;
             out.strings[s] = .{ .active = true, .cents = d.cents };
             out.active_count += 1;
+            if (!explained) independent += 1;
         }
+        // One note or a strum? A wound low E through a pickup often has
+        // partials 2-4 louder than its fundamental, and partials 3 and 4 sit
+        // on the open B3 and E4 targets, so the amplitude gate above lets
+        // them through as sounding strings. A strum has at least two
+        // sounding strings that are not partials of a lower one; anything
+        // less is one rich note, which the mono needle shows — reporting it
+        // here would flip the display to a strum of the note and its ghosts.
+        if (independent < 2) return .{};
         return out;
     }
 };
